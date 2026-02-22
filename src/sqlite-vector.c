@@ -117,6 +117,12 @@ SQLITE_EXTENSION_INIT1
 #define OPTION_KEY_QUANTTYPE                        "qtype"
 #define OPTION_KEY_QUANTSCALE                       "qscale"        // used only in serialize/unserialize
 #define OPTION_KEY_QUANTOFFSET                      "qoffset"       // used only in serialize/unserialize
+#define OPTION_KEY_IVF_NLIST                        "nlist"
+#define OPTION_KEY_IVF_NPROBE                       "nprobe"
+#define OPTION_KEY_IVF_MAX_MEMORY                   "max_memory"
+#define IVF_DEFAULT_NLIST                           64
+#define IVF_DEFAULT_NITER                           10
+#define IVF_DEFAULT_MAX_MEMORY                      (100LL * 1024 * 1024)   /* 100 MB */
 
 #define VECTOR_INTERNAL_TABLE                       "CREATE TABLE IF NOT EXISTS _sqliteai_vector (tblname TEXT, colname TEXT, key TEXT, value ANY, PRIMARY KEY(tblname, colname, key));"
 
@@ -142,6 +148,15 @@ typedef struct {
     
     void            *preloaded;
     int             precounter;
+
+    // IVF fields
+    int             ivf_nlist;          // number of clusters (0 = no IVF)
+    int             ivf_nprobe;         // number of clusters to search
+    int64_t         ivf_max_memory;     // max bytes for IVF preload (default 100MB)
+    float           *ivf_centroids;     // [nlist * dim] F32 centroids
+    void            **ivf_data;         // preloaded IVF data: [nlist] per-cluster stride buffers
+    // (ivf_offsets removed: per-cluster buffers start at offset 0)
+    int             *ivf_counts;        // [nlist] vector count per cluster
 } table_context;
 
 typedef struct {
@@ -158,10 +173,11 @@ typedef struct {
 typedef struct {
     sqlite3_vtab_cursor base;               // Base class - must be first
     table_context       *table;
-    
+
     // STREAMING VT INTERFACE
     bool                is_streaming;
     bool                is_quantized;
+    bool                stream_data_owned;  // if true, stream.data is owned by the cursor and must be freed
     struct {
         int64_t             rowid;
         double              distance;
@@ -490,6 +506,21 @@ static int sqlite_unserialize (sqlite3_context *context, table_context *ctx) {
         
         if (strcmp(key, OPTION_KEY_QUANTOFFSET) == 0) {
             ctx->offset = (float)sqlite3_column_double(vm, 1);
+            continue;
+        }
+
+        if (strcmp(key, OPTION_KEY_IVF_NLIST) == 0) {
+            ctx->ivf_nlist = sqlite3_column_int(vm, 1);
+            continue;
+        }
+
+        if (strcmp(key, OPTION_KEY_IVF_NPROBE) == 0) {
+            ctx->ivf_nprobe = sqlite3_column_int(vm, 1);
+            continue;
+        }
+
+        if (strcmp(key, OPTION_KEY_IVF_MAX_MEMORY) == 0) {
+            ctx->ivf_max_memory = sqlite3_column_int64(vm, 1);
             continue;
         }
     }
@@ -1134,6 +1165,52 @@ static char *generate_quant_table_name (const char *table_name, const char *colu
     return sqlite3_snprintf(STATIC_SQL_SIZE, sql, "vector0_%q_%q", table_name, column_name);
 }
 
+static char *generate_create_ivf_table (const char *table_name, const char *column_name, char sql[STATIC_SQL_SIZE]) {
+    return sqlite3_snprintf(STATIC_SQL_SIZE, sql, "CREATE TABLE IF NOT EXISTS ivf0_%q_%q (centroid_id INTEGER PRIMARY KEY, centroid BLOB, counter INTEGER, data BLOB);", table_name, column_name);
+}
+
+static char *generate_drop_ivf_table (const char *table_name, const char *column_name, char sql[STATIC_SQL_SIZE]) {
+    return sqlite3_snprintf(STATIC_SQL_SIZE, sql, "DROP TABLE IF EXISTS ivf0_%q_%q;", table_name, column_name);
+}
+
+static char *generate_insert_ivf_table (const char *table_name, const char *column_name, char sql[STATIC_SQL_SIZE]) {
+    return sqlite3_snprintf(STATIC_SQL_SIZE, sql, "INSERT INTO ivf0_%q_%q (centroid_id, centroid, counter, data) VALUES (?, ?, ?, ?);", table_name, column_name);
+}
+
+static char *generate_select_ivf_table (const char *table_name, const char *column_name, char sql[STATIC_SQL_SIZE]) {
+    return sqlite3_snprintf(STATIC_SQL_SIZE, sql, "SELECT centroid_id, centroid, counter, data FROM ivf0_%q_%q ORDER BY centroid_id;", table_name, column_name);
+}
+
+static char *generate_select_ivf_centroids (const char *table_name, const char *column_name, char sql[STATIC_SQL_SIZE]) {
+    return sqlite3_snprintf(STATIC_SQL_SIZE, sql, "SELECT centroid_id, centroid FROM ivf0_%q_%q ORDER BY centroid_id;", table_name, column_name);
+}
+
+// Build "SELECT counter, data FROM ivf0_<t>_<c> WHERE centroid_id IN (id0,id1,...)" into sql[4096].
+// ids/nids: cluster IDs to include. skip_preloaded: if non-NULL, skip ids where skip_preloaded[id] != NULL.
+// Returns number of IDs written, or 0 if none (sql left empty).
+#define IVF_IN_SQL_SIZE 4096
+static int generate_select_ivf_in (const char *table_name, const char *column_name,
+                                    const int *ids, int nids, int nlist, void **skip_preloaded,
+                                    char sql[IVF_IN_SQL_SIZE]) {
+    sqlite3_snprintf(IVF_IN_SQL_SIZE, sql,
+                     "SELECT counter, data FROM ivf0_%q_%q WHERE centroid_id IN (", table_name, column_name);
+    int off = (int)strlen(sql);
+    int written = 0;
+    for (int i = 0; i < nids; i++) {
+        int cid = ids[i];
+        if (cid < 0 || cid >= nlist) continue;
+        if (skip_preloaded && skip_preloaded[cid]) continue;
+        off += snprintf(sql + off, IVF_IN_SQL_SIZE - off, "%s%d", written ? "," : "", cid);
+        written++;
+    }
+    if (written > 0) snprintf(sql + off, IVF_IN_SQL_SIZE - off, ");");
+    return written;
+}
+
+static char *generate_ivf_table_name (const char *table_name, const char *column_name, char sql[STATIC_SQL_SIZE]) {
+    return sqlite3_snprintf(STATIC_SQL_SIZE, sql, "ivf0_%q_%q", table_name, column_name);
+}
+
 // MARK: - Vector Context and Options -
 
 void *vector_context_create (void) {
@@ -1152,6 +1229,14 @@ void vector_context_free (void *p) {
             if (ctx->tables[i].c_name) sqlite3_free(ctx->tables[i].c_name);
             if (ctx->tables[i].pk_name) sqlite3_free(ctx->tables[i].pk_name);
             if (ctx->tables[i].preloaded) sqlite3_free(ctx->tables[i].preloaded);
+            if (ctx->tables[i].ivf_centroids) sqlite3_free(ctx->tables[i].ivf_centroids);
+            if (ctx->tables[i].ivf_data) {
+                for (int c = 0; c < ctx->tables[i].ivf_nlist; c++) {
+                    if (ctx->tables[i].ivf_data[c]) sqlite3_free(ctx->tables[i].ivf_data[c]);
+                }
+                sqlite3_free(ctx->tables[i].ivf_data);
+            }
+            if (ctx->tables[i].ivf_counts) sqlite3_free(ctx->tables[i].ivf_counts);
         }
         sqlite3_free(p);
     }
@@ -1671,6 +1756,432 @@ static void vector_quantize_cleanup (sqlite3_context *context, int argc, sqlite3
     sqlite3_exec(db, sql, NULL, NULL, NULL);
 }
 
+// MARK: - IVF Functions -
+
+// Forward declarations for IVF
+static float *vector_to_f32 (const void *blob, vector_type type, int dim);
+static int kmeans_cluster (sqlite3 *db, const char *table_name, const char *column_name,
+                           table_context *t_ctx, int nlist, int niter,
+                           float **out_centroids, int **out_assignments, int *out_nrows);
+
+static bool ivf_keyvalue_callback (sqlite3_context *context, void *xdata, const char *key, int key_len, const char *value, int value_len) {
+    int64_t *params = (int64_t *)xdata; // params[0] = nlist, params[1] = nprobe, params[2] = max_memory
+    if (!key || key_len == 0 || !value || value_len == 0) return true;
+
+    char buffer[256] = {0};
+    size_t len = ((size_t)value_len > sizeof(buffer)-1) ? sizeof(buffer)-1 : (size_t)value_len;
+    memcpy(buffer, value, len);
+
+    if (KEY_MATCH(OPTION_KEY_IVF_NLIST)) {
+        int nlist = (int)strtol(buffer, NULL, 0);
+        if (nlist <= 0) return context_result_error(context, SQLITE_ERROR, "Invalid nlist value: expected a positive integer, got '%s'", buffer);
+        params[0] = nlist;
+        return true;
+    }
+
+    if (KEY_MATCH(OPTION_KEY_IVF_NPROBE)) {
+        int nprobe = (int)strtol(buffer, NULL, 0);
+        if (nprobe <= 0) return context_result_error(context, SQLITE_ERROR, "Invalid nprobe value: expected a positive integer, got '%s'", buffer);
+        params[1] = nprobe;
+        return true;
+    }
+
+    if (KEY_MATCH(OPTION_KEY_IVF_MAX_MEMORY)) {
+        uint64_t max_memory = human_to_number(buffer);
+        if (max_memory == 0) return context_result_error(context, SQLITE_ERROR, "Invalid max_memory value: expected a positive size (e.g. '100MB'), got '%s'", buffer);
+        params[2] = (int64_t)max_memory;
+        return true;
+    }
+
+    return true; // ignore unknown keys
+}
+
+static void vector_ivf_build3 (sqlite3_context *context, int argc, sqlite3_value **argv) {
+    int types[] = {SQLITE_TEXT, SQLITE_TEXT, SQLITE_TEXT};
+    if (sanity_check_args(context, "vector_ivf_build", argc, argv, 3, types) == false) return;
+
+    const char *table_name = (const char *)sqlite3_value_text(argv[0]);
+    const char *column_name = (const char *)sqlite3_value_text(argv[1]);
+    const char *arg_options = (const char *)sqlite3_value_text(argv[2]);
+
+    vector_context *v_ctx = (vector_context *)sqlite3_user_data(context);
+    table_context *t_ctx = vector_context_lookup(v_ctx, table_name, column_name);
+    if (!t_ctx) {
+        context_result_error(context, SQLITE_ERROR, "Vector context not found for table '%s' and column '%s'. Ensure that vector_init() has been called before using vector_ivf_build()", table_name, column_name);
+        return;
+    }
+
+    // Reject BIT type
+    if (t_ctx->options.v_type == VECTOR_TYPE_BIT) {
+        context_result_error(context, SQLITE_ERROR, "IVF indexing is not supported for BIT vector type");
+        return;
+    }
+
+    // Parse options: nlist, nprobe, max_memory
+    int64_t params[3] = {IVF_DEFAULT_NLIST, 0, IVF_DEFAULT_MAX_MEMORY}; // [nlist, nprobe, max_memory]
+    bool res = parse_keyvalue_string(context, arg_options, ivf_keyvalue_callback, params);
+    if (res == false) return;
+
+    int nlist = (int)params[0];
+    int nprobe = (int)params[1];
+    int64_t max_memory = params[2];
+    if (nprobe <= 0) {
+        // default: sqrt(nlist), clamped to [1, nlist]
+        nprobe = (int)sqrtf((float)nlist);
+        if (nprobe < 1) nprobe = 1;
+        if (nprobe > nlist) nprobe = nlist;
+    }
+
+    sqlite3 *db = sqlite3_context_db_handle(context);
+    int rc = SQLITE_ERROR;
+    char sql[STATIC_SQL_SIZE];
+    bool savepoint_open = false;
+    float *centroids = NULL;
+    int *assignments = NULL;
+    int nrows = 0;
+
+    rc = sqlite3_exec(db, "SAVEPOINT ivf_build;", NULL, NULL, NULL);
+    if (rc != SQLITE_OK) goto ivf_build_cleanup;
+    savepoint_open = true;
+
+    // Drop + create IVF table
+    generate_drop_ivf_table(table_name, column_name, sql);
+    rc = sqlite3_exec(db, sql, NULL, NULL, NULL);
+    if (rc != SQLITE_OK) goto ivf_build_cleanup;
+
+    generate_create_ivf_table(table_name, column_name, sql);
+    rc = sqlite3_exec(db, sql, NULL, NULL, NULL);
+    if (rc != SQLITE_OK) goto ivf_build_cleanup;
+
+    // Run k-means
+    rc = kmeans_cluster(db, table_name, column_name, t_ctx, nlist, IVF_DEFAULT_NITER, &centroids, &assignments, &nrows);
+    if (rc != SQLITE_OK) goto ivf_build_cleanup;
+
+    if (nrows == 0) {
+        // Empty table, just store metadata
+        t_ctx->ivf_nlist = nlist;
+        t_ctx->ivf_nprobe = nprobe;
+        rc = sqlite3_exec(db, "RELEASE ivf_build;", NULL, NULL, NULL);
+        if (rc != SQLITE_OK) goto ivf_build_cleanup;
+        savepoint_open = false;
+        sqlite3_result_int(context, 0);
+        return;
+    }
+
+    // Clamp nlist/nprobe to actual
+    if (nlist > nrows) nlist = nrows;
+    if (nprobe > nlist) nprobe = nlist;
+
+    {
+        int dim = t_ctx->options.v_dim;
+        vector_type type = t_ctx->options.v_type;
+        size_t vbytes = vector_bytes_for_dim(type, dim);
+        size_t stride = sizeof(int64_t) + vbytes;
+
+        // Count vectors per cluster
+        int *cluster_counts = (int *)sqlite3_malloc(nlist * (int)sizeof(int));
+        if (!cluster_counts) { rc = SQLITE_NOMEM; goto ivf_build_cleanup; }
+        memset(cluster_counts, 0, nlist * sizeof(int));
+        for (int i = 0; i < nrows; i++) cluster_counts[assignments[i]]++;
+
+        // Read original vectors from table with rowids for packing
+        sqlite3_stmt *read_vm = NULL;
+        generate_select_from_table(table_name, column_name, t_ctx->pk_name, sql);
+        rc = sqlite3_prepare_v2(db, sql, -1, &read_vm, NULL);
+        if (rc != SQLITE_OK) { sqlite3_free(cluster_counts); goto ivf_build_cleanup; }
+
+        // Allocate per-cluster data buffers
+        uint8_t **cluster_data = (uint8_t **)sqlite3_malloc(nlist * (int)sizeof(uint8_t *));
+        int *cluster_pos = (int *)sqlite3_malloc(nlist * (int)sizeof(int));
+        if (!cluster_data || !cluster_pos) {
+            sqlite3_finalize(read_vm);
+            sqlite3_free(cluster_counts);
+            if (cluster_data) sqlite3_free(cluster_data);
+            if (cluster_pos) sqlite3_free(cluster_pos);
+            rc = SQLITE_NOMEM;
+            goto ivf_build_cleanup;
+        }
+        memset(cluster_data, 0, nlist * sizeof(uint8_t *));
+        memset(cluster_pos, 0, nlist * sizeof(int));
+
+        for (int c = 0; c < nlist; c++) {
+            if (cluster_counts[c] > 0) {
+                cluster_data[c] = (uint8_t *)sqlite3_malloc64((sqlite3_uint64)cluster_counts[c] * stride);
+                if (!cluster_data[c]) {
+                    for (int j = 0; j < c; j++) if (cluster_data[j]) sqlite3_free(cluster_data[j]);
+                    sqlite3_free(cluster_data);
+                    sqlite3_free(cluster_pos);
+                    sqlite3_free(cluster_counts);
+                    sqlite3_finalize(read_vm);
+                    rc = SQLITE_NOMEM;
+                    goto ivf_build_cleanup;
+                }
+            }
+        }
+
+        // Re-read vectors and pack into cluster buffers
+        int vec_idx = 0;
+        size_t expected_bytes = vector_bytes_for_dim(type, dim);
+        while (1) {
+            rc = sqlite3_step(read_vm);
+            if (rc == SQLITE_DONE) { rc = SQLITE_OK; break; }
+            if (rc != SQLITE_ROW) break;
+            if (sqlite3_column_type(read_vm, 1) == SQLITE_NULL) continue;
+
+            const void *blob = sqlite3_column_blob(read_vm, 1);
+            if (!blob) continue;
+            if ((size_t)sqlite3_column_bytes(read_vm, 1) < expected_bytes) continue;
+
+            int64_t rowid = sqlite3_column_int64(read_vm, 0);
+            int c = assignments[vec_idx];
+
+            uint8_t *dest = cluster_data[c] + (size_t)cluster_pos[c] * stride;
+            INT64_TO_INT8PTR(rowid, dest);
+            memcpy(dest + sizeof(int64_t), blob, vbytes);
+            cluster_pos[c]++;
+            vec_idx++;
+        }
+        sqlite3_finalize(read_vm);
+
+        if (rc != SQLITE_OK) {
+            for (int c = 0; c < nlist; c++) if (cluster_data[c]) sqlite3_free(cluster_data[c]);
+            sqlite3_free(cluster_data);
+            sqlite3_free(cluster_pos);
+            sqlite3_free(cluster_counts);
+            goto ivf_build_cleanup;
+        }
+
+        // Insert centroid + data per cluster
+        sqlite3_stmt *ins_vm = NULL;
+        generate_insert_ivf_table(table_name, column_name, sql);
+        rc = sqlite3_prepare_v2(db, sql, -1, &ins_vm, NULL);
+        if (rc != SQLITE_OK) {
+            for (int c = 0; c < nlist; c++) if (cluster_data[c]) sqlite3_free(cluster_data[c]);
+            sqlite3_free(cluster_data);
+            sqlite3_free(cluster_pos);
+            sqlite3_free(cluster_counts);
+            goto ivf_build_cleanup;
+        }
+
+        for (int c = 0; c < nlist; c++) {
+            rc = sqlite3_reset(ins_vm);
+            if (rc != SQLITE_OK) break;
+
+            rc = sqlite3_bind_int(ins_vm, 1, c);
+            if (rc != SQLITE_OK) break;
+
+            // Centroid as F32 blob
+            rc = sqlite3_bind_blob(ins_vm, 2, centroids + c * dim, dim * (int)sizeof(float), SQLITE_STATIC);
+            if (rc != SQLITE_OK) break;
+
+            rc = sqlite3_bind_int(ins_vm, 3, cluster_counts[c]);
+            if (rc != SQLITE_OK) break;
+
+            if (cluster_counts[c] > 0) {
+                rc = sqlite3_bind_blob(ins_vm, 4, cluster_data[c], (int)((size_t)cluster_counts[c] * stride), SQLITE_STATIC);
+            } else {
+                rc = sqlite3_bind_null(ins_vm, 4);
+            }
+            if (rc != SQLITE_OK) break;
+
+            rc = sqlite3_step(ins_vm);
+            if (rc == SQLITE_DONE) rc = SQLITE_OK;
+            else break;
+        }
+        sqlite3_finalize(ins_vm);
+
+        for (int c = 0; c < nlist; c++) if (cluster_data[c]) sqlite3_free(cluster_data[c]);
+        sqlite3_free(cluster_data);
+        sqlite3_free(cluster_pos);
+        sqlite3_free(cluster_counts);
+
+        if (rc != SQLITE_OK) goto ivf_build_cleanup;
+    }
+
+    // Serialize metadata
+    rc = sqlite_serialize(context, table_name, column_name, SQLITE_INTEGER, OPTION_KEY_IVF_NLIST, nlist, 0);
+    if (rc != SQLITE_OK) goto ivf_build_cleanup;
+    rc = sqlite_serialize(context, table_name, column_name, SQLITE_INTEGER, OPTION_KEY_IVF_NPROBE, nprobe, 0);
+    if (rc != SQLITE_OK) goto ivf_build_cleanup;
+    rc = sqlite_serialize(context, table_name, column_name, SQLITE_INTEGER, OPTION_KEY_IVF_MAX_MEMORY, max_memory, 0);
+    if (rc != SQLITE_OK) goto ivf_build_cleanup;
+
+    // Store in table_context
+    t_ctx->ivf_nlist = nlist;
+    t_ctx->ivf_nprobe = nprobe;
+    t_ctx->ivf_max_memory = max_memory;
+
+    // Release savepoint
+    rc = sqlite3_exec(db, "RELEASE ivf_build;", NULL, NULL, NULL);
+    if (rc != SQLITE_OK) goto ivf_build_cleanup;
+    savepoint_open = false;
+
+    sqlite3_result_int(context, nrows);
+    if (centroids) sqlite3_free(centroids);
+    if (assignments) sqlite3_free(assignments);
+    return;
+
+ivf_build_cleanup: {
+        const char *errmsg = sqlite3_errmsg(db);
+        if (savepoint_open) {
+            sqlite3_exec(db, "ROLLBACK TO ivf_build;", NULL, NULL, NULL);
+            sqlite3_exec(db, "RELEASE ivf_build;", NULL, NULL, NULL);
+        }
+        if (centroids) sqlite3_free(centroids);
+        if (assignments) sqlite3_free(assignments);
+        sqlite3_result_error(context, errmsg, -1);
+        sqlite3_result_error_code(context, rc);
+    }
+}
+
+static void vector_ivf_preload_fn (sqlite3_context *context, int argc, sqlite3_value **argv) {
+    int types[] = {SQLITE_TEXT, SQLITE_TEXT};
+    if (sanity_check_args(context, "vector_ivf_preload", argc, argv, 2, types) == false) return;
+
+    const char *table_name = (const char *)sqlite3_value_text(argv[0]);
+    const char *column_name = (const char *)sqlite3_value_text(argv[1]);
+
+    vector_context *v_ctx = (vector_context *)sqlite3_user_data(context);
+    table_context *t_ctx = vector_context_lookup(v_ctx, table_name, column_name);
+    if (!t_ctx) {
+        context_result_error(context, SQLITE_ERROR, "Vector context not found for table '%s' and column '%s'", table_name, column_name);
+        return;
+    }
+
+    if (t_ctx->ivf_nlist <= 0) {
+        context_result_error(context, SQLITE_ERROR, "No IVF index found for table '%s' column '%s'. Call vector_ivf_build() first.", table_name, column_name);
+        return;
+    }
+
+    int nlist = t_ctx->ivf_nlist;
+    int dim = t_ctx->options.v_dim;
+
+    // Free previous preload
+    sqlite3_mutex_enter(qmutex);
+    if (t_ctx->ivf_centroids) { sqlite3_free(t_ctx->ivf_centroids); t_ctx->ivf_centroids = NULL; }
+    if (t_ctx->ivf_data) {
+        for (int c = 0; c < nlist; c++) {
+            if (t_ctx->ivf_data[c]) sqlite3_free(t_ctx->ivf_data[c]);
+        }
+        sqlite3_free(t_ctx->ivf_data); t_ctx->ivf_data = NULL;
+    }
+    if (t_ctx->ivf_counts) { sqlite3_free(t_ctx->ivf_counts); t_ctx->ivf_counts = NULL; }
+    sqlite3_mutex_leave(qmutex);
+
+    // Read all IVF table rows
+    char sql[STATIC_SQL_SIZE];
+    generate_select_ivf_table(table_name, column_name, sql);
+
+    sqlite3 *db = sqlite3_context_db_handle(context);
+    sqlite3_stmt *vm = NULL;
+    int rc = sqlite3_prepare_v2(db, sql, -1, &vm, NULL);
+    if (rc != SQLITE_OK) {
+        context_result_error(context, rc, "Failed to read IVF table: %s", sqlite3_errmsg(db));
+        return;
+    }
+
+    float *ivf_centroids = (float *)sqlite3_malloc64((sqlite3_uint64)nlist * dim * sizeof(float));
+    int *ivf_counts = (int *)sqlite3_malloc(nlist * (int)sizeof(int));
+    void **ivf_data = (void **)sqlite3_malloc(nlist * (int)sizeof(void *));
+    if (!ivf_centroids || !ivf_counts || !ivf_data) {
+        if (ivf_centroids) sqlite3_free(ivf_centroids);
+        if (ivf_counts) sqlite3_free(ivf_counts);
+        if (ivf_data) sqlite3_free(ivf_data);
+        sqlite3_finalize(vm);
+        context_result_error(context, SQLITE_NOMEM, "Out of memory");
+        return;
+    }
+    memset(ivf_counts, 0, nlist * sizeof(int));
+    memset(ivf_data, 0, nlist * sizeof(void *));
+
+    // Memory budget for cluster data (centroids and counts are always loaded)
+    int64_t max_memory = t_ctx->ivf_max_memory;
+    if (max_memory <= 0) max_memory = IVF_DEFAULT_MAX_MEMORY;
+    int64_t total_loaded = 0;
+
+    // Single pass: read centroids, counts, and per-cluster data
+    while (1) {
+        rc = sqlite3_step(vm);
+        if (rc == SQLITE_DONE) { rc = SQLITE_OK; break; }
+        if (rc != SQLITE_ROW) break;
+
+        int centroid_id = sqlite3_column_int(vm, 0);
+        if (centroid_id < 0 || centroid_id >= nlist) continue;
+
+        // Read centroid (always loaded)
+        const void *cent_blob = sqlite3_column_blob(vm, 1);
+        if (cent_blob && sqlite3_column_bytes(vm, 1) >= (int)(dim * sizeof(float))) {
+            memcpy(ivf_centroids + centroid_id * dim, cent_blob, dim * sizeof(float));
+        }
+
+        int count = sqlite3_column_int(vm, 2);
+        ivf_counts[centroid_id] = count;
+
+        // Allocate and copy per-cluster data only if within memory budget
+        const void *data_blob = sqlite3_column_blob(vm, 3);
+        int data_bytes = sqlite3_column_bytes(vm, 3);
+        if (data_blob && data_bytes > 0) {
+            if ((int64_t)data_bytes + total_loaded <= max_memory) {
+                ivf_data[centroid_id] = sqlite3_malloc64(data_bytes);
+                if (!ivf_data[centroid_id]) { rc = SQLITE_NOMEM; break; }
+                memcpy(ivf_data[centroid_id], data_blob, data_bytes);
+                total_loaded += data_bytes;
+            }
+            // else: skip — will fall back to disk read at query time
+        }
+    }
+    sqlite3_finalize(vm);
+
+    if (rc != SQLITE_OK) {
+        sqlite3_free(ivf_centroids);
+        sqlite3_free(ivf_counts);
+        for (int c = 0; c < nlist; c++) {
+            if (ivf_data[c]) sqlite3_free(ivf_data[c]);
+        }
+        sqlite3_free(ivf_data);
+        context_result_error(context, rc, "Error reading IVF data: %s", sqlite3_errmsg(db));
+        return;
+    }
+
+    sqlite3_mutex_enter(qmutex);
+    t_ctx->ivf_centroids = ivf_centroids;
+    t_ctx->ivf_data = ivf_data;
+    t_ctx->ivf_counts = ivf_counts;
+    sqlite3_mutex_leave(qmutex);
+}
+
+static void vector_ivf_cleanup_fn (sqlite3_context *context, int argc, sqlite3_value **argv) {
+    int types[] = {SQLITE_TEXT, SQLITE_TEXT};
+    if (sanity_check_args(context, "vector_ivf_cleanup", argc, argv, 2, types) == false) return;
+
+    const char *table_name = (const char *)sqlite3_value_text(argv[0]);
+    const char *column_name = (const char *)sqlite3_value_text(argv[1]);
+
+    vector_context *v_ctx = (vector_context *)sqlite3_user_data(context);
+    table_context *t_ctx = vector_context_lookup(v_ctx, table_name, column_name);
+    if (!t_ctx) return;
+
+    // Free IVF memory
+    sqlite3_mutex_enter(qmutex);
+    if (t_ctx->ivf_centroids) { sqlite3_free(t_ctx->ivf_centroids); t_ctx->ivf_centroids = NULL; }
+    if (t_ctx->ivf_data) {
+        for (int c = 0; c < t_ctx->ivf_nlist; c++) {
+            if (t_ctx->ivf_data[c]) sqlite3_free(t_ctx->ivf_data[c]);
+        }
+        sqlite3_free(t_ctx->ivf_data); t_ctx->ivf_data = NULL;
+    }
+    if (t_ctx->ivf_counts) { sqlite3_free(t_ctx->ivf_counts); t_ctx->ivf_counts = NULL; }
+    t_ctx->ivf_nlist = 0;
+    t_ctx->ivf_nprobe = 0;
+    sqlite3_mutex_leave(qmutex);
+
+    // Drop IVF table
+    char sql[STATIC_SQL_SIZE];
+    sqlite3 *db = sqlite3_context_db_handle(context);
+    generate_drop_ivf_table(table_name, column_name, sql);
+    sqlite3_exec(db, sql, NULL, NULL, NULL);
+}
+
 // MARK: -
 
 static void *vector_from_json (sqlite3_context *context, sqlite3_vtab *vtab, vector_type type, const char *json, int *size, int dimension) {
@@ -1898,6 +2409,257 @@ static void vector_as_bit (sqlite3_context *context, int argc, sqlite3_value **a
     vector_as_type(context, VECTOR_TYPE_BIT, argc, argv);
 }
 
+// MARK: - IVF -
+
+// Convert any supported vector type to a temporary F32 buffer. Caller must sqlite3_free().
+static float *vector_to_f32 (const void *blob, vector_type type, int dim) {
+    float *out = (float *)sqlite3_malloc(dim * (int)sizeof(float));
+    if (!out) return NULL;
+
+    switch (type) {
+        case VECTOR_TYPE_F32:
+            memcpy(out, blob, dim * sizeof(float));
+            break;
+        case VECTOR_TYPE_F16: {
+            const uint16_t *src = (const uint16_t *)blob;
+            for (int i = 0; i < dim; i++) out[i] = float16_to_float32(src[i]);
+            break;
+        }
+        case VECTOR_TYPE_BF16: {
+            const uint16_t *src = (const uint16_t *)blob;
+            for (int i = 0; i < dim; i++) out[i] = bfloat16_to_float32(src[i]);
+            break;
+        }
+        case VECTOR_TYPE_U8: {
+            const uint8_t *src = (const uint8_t *)blob;
+            for (int i = 0; i < dim; i++) out[i] = (float)src[i];
+            break;
+        }
+        case VECTOR_TYPE_I8: {
+            const int8_t *src = (const int8_t *)blob;
+            for (int i = 0; i < dim; i++) out[i] = (float)src[i];
+            break;
+        }
+        default:
+            sqlite3_free(out);
+            return NULL;
+    }
+    return out;
+}
+
+// Simple portable xorshift32 PRNG
+static uint32_t xorshift32 (uint32_t *state) {
+    uint32_t x = *state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    *state = x;
+    return x;
+}
+
+// Convert a vector blob to F32 into a pre-allocated destination buffer.
+static void vector_convert_to_f32 (const void *blob, vector_type type, int dim, float *dest) {
+    switch (type) {
+        case VECTOR_TYPE_F32:
+            memcpy(dest, blob, dim * sizeof(float));
+            break;
+        case VECTOR_TYPE_F16: {
+            const uint16_t *src = (const uint16_t *)blob;
+            for (int i = 0; i < dim; i++) dest[i] = float16_to_float32(src[i]);
+            break;
+        }
+        case VECTOR_TYPE_BF16: {
+            const uint16_t *src = (const uint16_t *)blob;
+            for (int i = 0; i < dim; i++) dest[i] = bfloat16_to_float32(src[i]);
+            break;
+        }
+        case VECTOR_TYPE_U8: {
+            const uint8_t *src = (const uint8_t *)blob;
+            for (int i = 0; i < dim; i++) dest[i] = (float)src[i];
+            break;
+        }
+        case VECTOR_TYPE_I8: {
+            const int8_t *src = (const int8_t *)blob;
+            for (int i = 0; i < dim; i++) dest[i] = (float)src[i];
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+// K-means clustering (streaming). Reads vectors from SQLite on each iteration
+// to avoid allocating O(N*dim) memory. Returns centroids [nlist*dim] and
+// per-vector assignments [nrows].
+static int kmeans_cluster (sqlite3 *db, const char *table_name, const char *column_name,
+                           table_context *t_ctx, int nlist, int niter,
+                           float **out_centroids, int **out_assignments, int *out_nrows) {
+    int rc = SQLITE_OK;
+    sqlite3_stmt *vm = NULL;
+    float *centroids = NULL;
+    float *accum = NULL;
+    int *assignments = NULL;
+    int *counts = NULL;
+    float *tmp_vec = NULL;
+    float *reseed_vec = NULL;
+
+    int dim = t_ctx->options.v_dim;
+    vector_type type = t_ctx->options.v_type;
+    const char *pk_name = t_ctx->pk_name;
+    size_t expected_bytes = vector_bytes_for_dim(type, dim);
+
+    // Step 1: count rows
+    char sql[STATIC_SQL_SIZE];
+    sqlite3_snprintf(sizeof(sql), sql, "SELECT COUNT(*) FROM %q WHERE %q IS NOT NULL;", table_name, column_name);
+    int64_t total = sqlite_read_int64(db, sql);
+    if (total <= 0) { *out_nrows = 0; return SQLITE_OK; }
+
+    int nrows = 0;
+
+    // Allocate small buffers only: centroids, accumulator, assignments, counts, tmp_vec
+    tmp_vec = (float *)sqlite3_malloc(dim * (int)sizeof(float));
+    reseed_vec = (float *)sqlite3_malloc(dim * (int)sizeof(float));
+    if (!tmp_vec || !reseed_vec) { rc = SQLITE_NOMEM; goto kmeans_cleanup; }
+
+    // Step 2: Initialize centroids by streaming with reservoir sampling
+    generate_select_from_table(table_name, column_name, pk_name, sql);
+    rc = sqlite3_prepare_v2(db, sql, -1, &vm, NULL);
+    if (rc != SQLITE_OK) goto kmeans_cleanup;
+
+    {
+        uint32_t rng_state = 42;
+        while (1) {
+            rc = sqlite3_step(vm);
+            if (rc == SQLITE_DONE) { rc = SQLITE_OK; break; }
+            if (rc != SQLITE_ROW) goto kmeans_cleanup;
+            if (sqlite3_column_type(vm, 1) == SQLITE_NULL) continue;
+
+            const void *blob = sqlite3_column_blob(vm, 1);
+            if (!blob) continue;
+            if ((size_t)sqlite3_column_bytes(vm, 1) < expected_bytes) continue;
+
+            vector_convert_to_f32(blob, type, dim, tmp_vec);
+
+            // Allocate centroids lazily after we know we have valid data
+            if (nrows == 0) {
+                centroids = (float *)sqlite3_malloc64((sqlite3_uint64)nlist * dim * sizeof(float));
+                if (!centroids) { rc = SQLITE_NOMEM; sqlite3_finalize(vm); vm = NULL; goto kmeans_cleanup; }
+            }
+
+            // Reservoir sampling: keep nlist random vectors as initial centroids
+            if (nrows < nlist) {
+                memcpy(centroids + nrows * dim, tmp_vec, dim * sizeof(float));
+            } else {
+                uint32_t j = xorshift32(&rng_state) % (uint32_t)(nrows + 1);
+                if ((int)j < nlist) {
+                    memcpy(centroids + j * dim, tmp_vec, dim * sizeof(float));
+                }
+            }
+            nrows++;
+        }
+    }
+    sqlite3_finalize(vm);
+    vm = NULL;
+
+    if (nrows == 0) { *out_nrows = 0; goto kmeans_cleanup; }
+
+    // Clamp nlist to nrows
+    if (nlist > nrows) nlist = nrows;
+
+    // Allocate assignments, counts, accumulator
+    assignments = (int *)sqlite3_malloc64((sqlite3_uint64)nrows * sizeof(int));
+    counts = (int *)sqlite3_malloc(nlist * (int)sizeof(int));
+    accum = (float *)sqlite3_malloc64((sqlite3_uint64)nlist * dim * sizeof(float));
+    if (!assignments || !counts || !accum) { rc = SQLITE_NOMEM; goto kmeans_cleanup; }
+
+    // Step 3: K-means iterations (streaming from SQLite each iteration)
+    for (int iter = 0; iter < niter; iter++) {
+        rc = sqlite3_prepare_v2(db, sql, -1, &vm, NULL);
+        if (rc != SQLITE_OK) goto kmeans_cleanup;
+
+        memset(counts, 0, nlist * sizeof(int));
+        memset(accum, 0, (size_t)nlist * dim * sizeof(float));
+
+        uint32_t reseed_rng = (uint32_t)(42 + iter);
+        int reseed_count = 0;
+        int v = 0;
+
+        while (1) {
+            rc = sqlite3_step(vm);
+            if (rc == SQLITE_DONE) { rc = SQLITE_OK; break; }
+            if (rc != SQLITE_ROW) { sqlite3_finalize(vm); vm = NULL; goto kmeans_cleanup; }
+            if (sqlite3_column_type(vm, 1) == SQLITE_NULL) continue;
+
+            const void *blob = sqlite3_column_blob(vm, 1);
+            if (!blob) continue;
+            if ((size_t)sqlite3_column_bytes(vm, 1) < expected_bytes) continue;
+
+            vector_convert_to_f32(blob, type, dim, tmp_vec);
+
+            // Find nearest centroid (L2 squared)
+            float best_dist = FLT_MAX;
+            int best_c = 0;
+            for (int c = 0; c < nlist; c++) {
+                const float *cent = centroids + c * dim;
+                float dist = 0.0f;
+                for (int d = 0; d < dim; d++) {
+                    float diff = tmp_vec[d] - cent[d];
+                    dist += diff * diff;
+                }
+                if (dist < best_dist) { best_dist = dist; best_c = c; }
+            }
+            assignments[v] = best_c;
+            counts[best_c]++;
+
+            // Accumulate for centroid recomputation
+            float *acc = accum + best_c * dim;
+            for (int d = 0; d < dim; d++) acc[d] += tmp_vec[d];
+
+            // Reservoir sample one random vector for re-seeding empty clusters
+            reseed_count++;
+            if (reseed_count == 1 || (xorshift32(&reseed_rng) % (uint32_t)reseed_count) == 0) {
+                memcpy(reseed_vec, tmp_vec, dim * sizeof(float));
+            }
+
+            v++;
+        }
+        sqlite3_finalize(vm);
+        vm = NULL;
+
+        // Compute new centroids from accumulated sums
+        for (int c = 0; c < nlist; c++) {
+            if (counts[c] > 0) {
+                float *acc = accum + c * dim;
+                float inv = 1.0f / (float)counts[c];
+                for (int d = 0; d < dim; d++) centroids[c * dim + d] = acc[d] * inv;
+            } else {
+                // Re-seed empty cluster from reservoir-sampled vector with small perturbation
+                memcpy(centroids + c * dim, reseed_vec, dim * sizeof(float));
+                uint32_t perturb_rng = (uint32_t)(42 + iter * nlist + c);
+                for (int d = 0; d < dim; d++) {
+                    centroids[c * dim + d] += ((float)(xorshift32(&perturb_rng) % 100) - 50.0f) * 1e-5f;
+                }
+            }
+        }
+    }
+
+    *out_centroids = centroids;
+    *out_assignments = assignments;
+    *out_nrows = nrows;
+    centroids = NULL;   // prevent free below
+    assignments = NULL;
+
+kmeans_cleanup:
+    if (vm) sqlite3_finalize(vm);
+    if (centroids) sqlite3_free(centroids);
+    if (accum) sqlite3_free(accum);
+    if (assignments) sqlite3_free(assignments);
+    if (counts) sqlite3_free(counts);
+    if (tmp_vec) sqlite3_free(tmp_vec);
+    if (reseed_vec) sqlite3_free(reseed_vec);
+    return rc;
+}
+
 // MARK: - Modules -
 static int vFullScanCursorNext (sqlite3_vtab_cursor *cur);
 static int vStreamScanCursorRun (sqlite3 *db, vFullScanCursor *c, const void *v1, int v1size);
@@ -2109,6 +2871,7 @@ static int vFullScanCursorClose (sqlite3_vtab_cursor *cur){
     if (c->distance) sqlite3_free(c->distance);
     if (c->stream.vector) sqlite3_free(c->stream.vector);
     if (c->stream.vm) sqlite3_finalize(c->stream.vm);
+    if (c->stream_data_owned && c->stream.data) sqlite3_free(c->stream.data);
     sqlite3_free(c);
     return SQLITE_OK;
 }
@@ -2663,6 +3426,328 @@ static sqlite3_module vQuantScanModule = {
   /* xIntegrity  */ 0
 };
 
+// MARK: - IVF Scan Module -
+
+// Find the nprobe nearest centroids to a query vector.
+static void ivf_find_nprobe_centroids (const float *query_f32, const float *centroids, int nlist, int dim, int nprobe, int *out_ids) {
+    // Compute L2 squared distances from query to each centroid
+    // Use simple partial selection: maintain sorted list of nprobe best
+    for (int i = 0; i < nprobe; i++) out_ids[i] = -1;
+
+    float *best_dists = (float *)sqlite3_malloc(nprobe * (int)sizeof(float));
+    if (!best_dists) return;
+    for (int i = 0; i < nprobe; i++) best_dists[i] = FLT_MAX;
+
+    for (int c = 0; c < nlist; c++) {
+        const float *cent = centroids + c * dim;
+        float dist = 0.0f;
+        for (int d = 0; d < dim; d++) {
+            float diff = query_f32[d] - cent[d];
+            dist += diff * diff;
+        }
+
+        // Check if this centroid is closer than the worst in our list
+        int worst_idx = 0;
+        for (int i = 1; i < nprobe; i++) {
+            if (best_dists[i] > best_dists[worst_idx]) worst_idx = i;
+        }
+        if (dist < best_dists[worst_idx]) {
+            best_dists[worst_idx] = dist;
+            out_ids[worst_idx] = c;
+        }
+    }
+
+    sqlite3_free(best_dists);
+}
+
+static int vIVFScanRun (sqlite3 *db, vFullScanCursor *c, const void *v1, int v1size) {
+    table_context *t_ctx = c->table;
+    int dim = t_ctx->options.v_dim;
+    int nlist = t_ctx->ivf_nlist;
+    int nprobe = t_ctx->ivf_nprobe;
+    vector_type vt = t_ctx->options.v_type;
+    vector_distance vd = t_ctx->options.v_distance;
+
+    // Convert query to F32 for centroid search
+    float *query_f32 = vector_to_f32(v1, vt, dim);
+    if (!query_f32) return SQLITE_NOMEM;
+
+    // Find nprobe nearest centroids
+    int *probe_ids = (int *)sqlite3_malloc(nprobe * (int)sizeof(int));
+    if (!probe_ids) { sqlite3_free(query_f32); return SQLITE_NOMEM; }
+
+    // We need centroids - either preloaded or from disk
+    float *centroids_buf = NULL;
+    const float *centroids = t_ctx->ivf_centroids;
+    if (!centroids) {
+        // Read centroids from IVF table
+        char sql[STATIC_SQL_SIZE];
+        generate_select_ivf_centroids(t_ctx->t_name, t_ctx->c_name, sql);
+        sqlite3_stmt *vm = NULL;
+        int rc = sqlite3_prepare_v2(db, sql, -1, &vm, NULL);
+        if (rc != SQLITE_OK) { sqlite3_free(query_f32); sqlite3_free(probe_ids); return rc; }
+
+        centroids_buf = (float *)sqlite3_malloc64((sqlite3_uint64)nlist * dim * sizeof(float));
+        if (!centroids_buf) { sqlite3_finalize(vm); sqlite3_free(query_f32); sqlite3_free(probe_ids); return SQLITE_NOMEM; }
+        memset(centroids_buf, 0, (size_t)nlist * dim * sizeof(float));
+
+        while (sqlite3_step(vm) == SQLITE_ROW) {
+            int cid = sqlite3_column_int(vm, 0);
+            if (cid >= 0 && cid < nlist) {
+                const void *blob = sqlite3_column_blob(vm, 1);
+                if (blob && sqlite3_column_bytes(vm, 1) >= (int)(dim * sizeof(float))) {
+                    memcpy(centroids_buf + cid * dim, blob, dim * sizeof(float));
+                }
+            }
+        }
+        sqlite3_finalize(vm);
+        centroids = centroids_buf;
+    }
+
+    ivf_find_nprobe_centroids(query_f32, centroids, nlist, dim, nprobe, probe_ids);
+    sqlite3_free(query_f32);
+
+    // Compute distance function
+    distance_function_t distance_fn = dispatch_distance_table[vd][vt];
+    size_t vbytes = vector_bytes_for_dim(vt, dim);
+    size_t stride = sizeof(int64_t) + vbytes;
+    int dist_size = dim;
+
+    // Process preloaded clusters from memory
+    if (t_ctx->ivf_data) {
+        for (int p = 0; p < nprobe; p++) {
+            int cid = probe_ids[p];
+            if (cid < 0 || cid >= nlist) continue;
+            if (!t_ctx->ivf_data[cid]) continue; // not preloaded, handled below
+            int count = t_ctx->ivf_counts[cid];
+            const uint8_t *data = (const uint8_t *)t_ctx->ivf_data[cid];
+
+            for (int i = 0; i < count; i++) {
+                const uint8_t *entry = data + i * stride;
+                const void *vec_data = entry + sizeof(int64_t);
+                float dist = distance_fn(v1, vec_data, dist_size);
+                if (nearly_zero_float32(dist)) dist = 0.0f;
+
+                if (dist < c->distance[c->max_index]) {
+                    c->distance[c->max_index] = dist;
+                    c->rowids[c->max_index] = INT64_FROM_INT8PTR(entry);
+                    c->max_index = vFullScanFindMaxIndex(c->distance, c->row_count);
+                }
+            }
+        }
+    }
+
+    // Disk fallback for non-preloaded probe clusters
+    {
+        char in_sql[IVF_IN_SQL_SIZE];
+        int disk_count = generate_select_ivf_in(t_ctx->t_name, t_ctx->c_name,
+                                                 probe_ids, nprobe, nlist, t_ctx->ivf_data, in_sql);
+        if (disk_count > 0) {
+            sqlite3_stmt *vm = NULL;
+            int rc = sqlite3_prepare_v2(db, in_sql, -1, &vm, NULL);
+            if (rc != SQLITE_OK) { sqlite3_free(probe_ids); if (centroids_buf) sqlite3_free(centroids_buf); return rc; }
+
+            while (sqlite3_step(vm) == SQLITE_ROW) {
+                int counter = sqlite3_column_int(vm, 0);
+                const uint8_t *data = (const uint8_t *)sqlite3_column_blob(vm, 1);
+                if (!data) continue;
+
+                for (int i = 0; i < counter; i++) {
+                    const uint8_t *entry = data + i * stride;
+                    const void *vec_data = entry + sizeof(int64_t);
+                    float dist = distance_fn(v1, vec_data, dist_size);
+                    if (nearly_zero_float32(dist)) dist = 0.0f;
+
+                    if (dist < c->distance[c->max_index]) {
+                        c->distance[c->max_index] = dist;
+                        c->rowids[c->max_index] = INT64_FROM_INT8PTR(entry);
+                        c->max_index = vFullScanFindMaxIndex(c->distance, c->row_count);
+                    }
+                }
+            }
+            sqlite3_finalize(vm);
+        }
+    }
+
+    sqlite3_free(probe_ids);
+    if (centroids_buf) sqlite3_free(centroids_buf);
+    return SQLITE_OK;
+}
+
+static int vIVFStreamCursorRun (sqlite3 *db, vFullScanCursor *c, const void *v1, int v1size) {
+    table_context *t_ctx = c->table;
+    int dim = t_ctx->options.v_dim;
+    int nlist = t_ctx->ivf_nlist;
+    int nprobe = t_ctx->ivf_nprobe;
+    vector_type vt = t_ctx->options.v_type;
+    vector_distance vd = t_ctx->options.v_distance;
+
+    // Duplicate input vector
+    void *v = sqlite_memdup(v1, v1size);
+    if (!v) return SQLITE_NOMEM;
+
+    c->stream.vector = v;
+    c->stream.vsize = v1size;
+    c->stream.vdim = dim;
+
+    // Compute distance function
+    distance_function_t distance_fn = dispatch_distance_table[vd][vt];
+    c->stream.distance_fn = distance_fn;
+
+    // Convert query to F32 for centroid search
+    float *query_f32 = vector_to_f32(v1, vt, dim);
+    if (!query_f32) return SQLITE_NOMEM;
+
+    // Get centroids (preloaded or from disk)
+    float *centroids_buf = NULL;
+    const float *centroids = t_ctx->ivf_centroids;
+    if (!centroids) {
+        char sql[STATIC_SQL_SIZE];
+        generate_select_ivf_centroids(t_ctx->t_name, t_ctx->c_name, sql);
+        sqlite3_stmt *vm = NULL;
+        int rc = sqlite3_prepare_v2(db, sql, -1, &vm, NULL);
+        if (rc != SQLITE_OK) { sqlite3_free(query_f32); return rc; }
+
+        centroids_buf = (float *)sqlite3_malloc64((sqlite3_uint64)nlist * dim * sizeof(float));
+        if (!centroids_buf) { sqlite3_finalize(vm); sqlite3_free(query_f32); return SQLITE_NOMEM; }
+        memset(centroids_buf, 0, (size_t)nlist * dim * sizeof(float));
+
+        while (sqlite3_step(vm) == SQLITE_ROW) {
+            int cid = sqlite3_column_int(vm, 0);
+            if (cid >= 0 && cid < nlist) {
+                const void *blob = sqlite3_column_blob(vm, 1);
+                if (blob && sqlite3_column_bytes(vm, 1) >= (int)(dim * sizeof(float))) {
+                    memcpy(centroids_buf + cid * dim, blob, dim * sizeof(float));
+                }
+            }
+        }
+        sqlite3_finalize(vm);
+        centroids = centroids_buf;
+    }
+
+    int *probe_ids = (int *)sqlite3_malloc(nprobe * (int)sizeof(int));
+    if (!probe_ids) { sqlite3_free(query_f32); if (centroids_buf) sqlite3_free(centroids_buf); return SQLITE_NOMEM; }
+    ivf_find_nprobe_centroids(query_f32, centroids, nlist, dim, nprobe, probe_ids);
+    sqlite3_free(query_f32);
+
+    size_t vbytes = vector_bytes_for_dim(vt, dim);
+    size_t stride = sizeof(int64_t) + vbytes;
+
+    {
+        // Count total vectors across all probe clusters (from ivf_counts, always available)
+        int total_count = 0;
+        for (int p = 0; p < nprobe; p++) {
+            int cid = probe_ids[p];
+            if (cid >= 0 && cid < nlist) total_count += t_ctx->ivf_counts[cid];
+        }
+
+        if (total_count > 0) {
+            // Allocate merged buffer for all probe clusters
+            void *merged = sqlite3_malloc64((sqlite3_uint64)total_count * stride);
+            if (!merged) { sqlite3_free(probe_ids); if (centroids_buf) sqlite3_free(centroids_buf); return SQLITE_NOMEM; }
+
+            size_t buf_offset = 0;
+
+            // Copy preloaded clusters from memory
+            if (t_ctx->ivf_data) {
+                for (int p = 0; p < nprobe; p++) {
+                    int cid = probe_ids[p];
+                    if (cid < 0 || cid >= nlist || t_ctx->ivf_counts[cid] == 0) continue;
+                    if (!t_ctx->ivf_data[cid]) continue; // not preloaded, handled below
+                    size_t chunk_size = (size_t)t_ctx->ivf_counts[cid] * stride;
+                    memcpy((uint8_t *)merged + buf_offset, t_ctx->ivf_data[cid], chunk_size);
+                    buf_offset += chunk_size;
+                }
+            }
+
+            // Query non-preloaded clusters from disk
+            {
+                char in_sql[IVF_IN_SQL_SIZE];
+                int disk_count = generate_select_ivf_in(t_ctx->t_name, t_ctx->c_name,
+                                                         probe_ids, nprobe, nlist, t_ctx->ivf_data, in_sql);
+                if (disk_count > 0) {
+                    sqlite3_stmt *disk_vm = NULL;
+                    int rc = sqlite3_prepare_v2(db, in_sql, -1, &disk_vm, NULL);
+                    if (rc != SQLITE_OK) { sqlite3_free(merged); sqlite3_free(probe_ids); if (centroids_buf) sqlite3_free(centroids_buf); return rc; }
+
+                    while (sqlite3_step(disk_vm) == SQLITE_ROW) {
+                        int counter = sqlite3_column_int(disk_vm, 0);
+                        const uint8_t *data = (const uint8_t *)sqlite3_column_blob(disk_vm, 1);
+                        if (!data || counter <= 0) continue;
+                        size_t chunk_size = (size_t)counter * stride;
+                        memcpy((uint8_t *)merged + buf_offset, data, chunk_size);
+                        buf_offset += chunk_size;
+                    }
+                    sqlite3_finalize(disk_vm);
+                }
+            }
+
+            c->stream.data = merged;
+            c->stream.dcounter = (int)(buf_offset / stride);
+            c->stream.dindex = 0;
+            c->stream_data_owned = true;
+            c->is_quantized = true;  // reuse quantized in-memory code path
+        } else {
+            c->stream.is_eof = 1;
+        }
+
+        // Set vsize to match stride vector portion
+        c->stream.vsize = (int)vbytes;
+    }
+
+    sqlite3_free(probe_ids);
+    if (centroids_buf) sqlite3_free(centroids_buf);
+    return SQLITE_OK;
+}
+
+static int vIVFCursorFilter (sqlite3_vtab_cursor *cur, int idxNum, const char *idxStr, int argc, sqlite3_value **argv) {
+    // Verify IVF index exists
+    vFullScan *vtab = (vFullScan *)cur->pVtab;
+    if (argc >= 2) {
+        const char *table_name = (const char *)sqlite3_value_text(argv[0]);
+        const char *column_name = (const char *)sqlite3_value_text(argv[1]);
+        table_context *t_ctx = vector_context_lookup(vtab->ctx, table_name, column_name);
+        if (!t_ctx || t_ctx->ivf_nlist <= 0) {
+            return sqlite_vtab_set_error(&vtab->base, "No IVF index found. Call vector_ivf_build() first.");
+        }
+        // Check IVF table exists
+        char buffer[STATIC_SQL_SIZE];
+        generate_ivf_table_name(table_name, column_name, buffer);
+        if (!sqlite_table_exists(vtab->db, buffer)) {
+            return sqlite_vtab_set_error(&vtab->base, "IVF table not found. Call vector_ivf_build() first.");
+        }
+    }
+    return vCursorFilterCommon(cur, idxNum, idxStr, argc, argv, "vector_ivf_scan", vIVFScanRun, vFullScanSortSlots, vIVFStreamCursorRun, false);
+}
+
+static sqlite3_module vIVFScanModule = {
+  /* iVersion    */ 0,
+  /* xCreate     */ 0,
+  /* xConnect    */ vFullScanConnect,
+  /* xBestIndex  */ vFullScanBestIndex,
+  /* xDisconnect */ vFullScanDisconnect,
+  /* xDestroy    */ 0,
+  /* xOpen       */ vFullScanCursorOpen,
+  /* xClose      */ vFullScanCursorClose,
+  /* xFilter     */ vIVFCursorFilter,
+  /* xNext       */ vFullScanCursorNext,
+  /* xEof        */ vFullScanCursorEof,
+  /* xColumn     */ vFullScanCursorColumn,
+  /* xRowid      */ vFullScanCursorRowid,
+  /* xUpdate     */ 0,
+  /* xBegin      */ 0,
+  /* xSync       */ 0,
+  /* xCommit     */ 0,
+  /* xRollback   */ 0,
+  /* xFindMethod */ 0,
+  /* xRename     */ 0,
+  /* xSavepoint  */ 0,
+  /* xRelease    */ 0,
+  /* xRollbackTo */ 0,
+  /* xShadowName */ 0,
+  /* xIntegrity  */ 0
+};
+
 // MARK: -
 
 static void vector_init (sqlite3_context *context, int argc, sqlite3_value **argv) {
@@ -2827,6 +3912,19 @@ SQLITE_VECTOR_API int sqlite3_vector_init (sqlite3 *db, char **pzErrMsg, const s
     rc = sqlite3_create_module(db, "vector_full_scan_stream", &vFullScanModule, ctx);
     if (rc != SQLITE_OK) goto cleanup;
     rc = sqlite3_create_module(db, "vector_quantize_scan_stream", &vQuantScanModule, ctx);
+    if (rc != SQLITE_OK) goto cleanup;
+
+    // IVF functions
+    rc = sqlite3_create_function(db, "vector_ivf_build", 3, SQLITE_UTF8, ctx, vector_ivf_build3, NULL, NULL);
+    if (rc != SQLITE_OK) goto cleanup;
+
+    rc = sqlite3_create_function(db, "vector_ivf_preload", 2, SQLITE_UTF8, ctx, vector_ivf_preload_fn, NULL, NULL);
+    if (rc != SQLITE_OK) goto cleanup;
+
+    rc = sqlite3_create_function(db, "vector_ivf_cleanup", 2, SQLITE_UTF8, ctx, vector_ivf_cleanup_fn, NULL, NULL);
+    if (rc != SQLITE_OK) goto cleanup;
+
+    rc = sqlite3_create_module(db, "vector_ivf_scan", &vIVFScanModule, ctx);
     if (rc != SQLITE_OK) goto cleanup;
 
     return SQLITE_OK;

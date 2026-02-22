@@ -133,6 +133,11 @@ unittest:
 	$(CC) $(CFLAGS) -DSQLITE_CORE -O2 $(TEST_SRC) -o $(BUILD_DIR)/test_vector -lm -lpthread
 	./$(BUILD_DIR)/test_vector
 
+BENCH_SRC = test/bench_vector.c libs/sqlite3.c $(SRC_FILES)
+benchmark:
+	$(CC) $(CFLAGS) -DSQLITE_CORE -O2 $(BENCH_SRC) -o $(BUILD_DIR)/bench_vector -lm -lpthread
+	./$(BUILD_DIR)/bench_vector
+
 # Clean up generated files
 clean:
 	rm -rf $(BUILD_DIR)/* $(DIST_DIR)/* *.gcda *.gcno *.gcov *.sqlite
@@ -234,4 +239,4 @@ help:
 	@echo "  xcframework	- Build the Apple XCFramework"
 	@echo "  aar			- Build the Android AAR package"
 
-.PHONY: all clean test unittest extension help version xcframework aar
+.PHONY: all clean test unittest benchmark extension help version xcframework aar

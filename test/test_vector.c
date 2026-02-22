@@ -272,6 +272,96 @@ static void test_quantize_scan(sqlite3 *db, const char *type, const char *qtype,
     }
 }
 
+/* ---------- Test: vector_ivf_scan for a given (type, distance) pair ---------- */
+
+static void test_ivf_scan(sqlite3 *db, const char *type, const char *distance,
+                          int dim, const char **vecs, int nvecs,
+                          const char *query_vec) {
+    char tbl[64], sql[1024], msg[256];
+    snprintf(tbl, sizeof(tbl), "tivf_%s_%s", type, distance);
+
+    for (char *p = tbl; *p; p++) if (*p >= 'A' && *p <= 'Z') *p += 32;
+
+    if (setup_table(db, tbl, type, distance, dim, vecs, nvecs) != 0) {
+        snprintf(msg, sizeof(msg), "ivf_scan setup %s/%s", type, distance);
+        ASSERT(0, msg);
+        return;
+    }
+
+    /* vector_ivf_build with small nlist for 10 vectors */
+    snprintf(sql, sizeof(sql),
+             "SELECT vector_ivf_build('%s', 'v', 'nlist=3');", tbl);
+    if (exec_sql(db, sql) != SQLITE_OK) {
+        snprintf(msg, sizeof(msg), "vector_ivf_build %s/%s", type, distance);
+        ASSERT(0, msg);
+        return;
+    }
+
+    /* vector_ivf_preload */
+    snprintf(sql, sizeof(sql),
+             "SELECT vector_ivf_preload('%s', 'v');", tbl);
+    if (exec_sql(db, sql) != SQLITE_OK) {
+        snprintf(msg, sizeof(msg), "vector_ivf_preload %s/%s", type, distance);
+        ASSERT(0, msg);
+        return;
+    }
+
+    int is_dot = (strcasecmp(distance, "DOT") == 0);
+
+    /* Top-k mode (k=3) */
+    {
+        scan_result r = {0};
+        snprintf(sql, sizeof(sql),
+                 "SELECT id, distance FROM vector_ivf_scan('%s', 'v', vector_as_%s('%s'), 3);",
+                 tbl, type, query_vec);
+        char *err = NULL;
+        int rc = sqlite3_exec(db, sql, scan_cb, &r, &err);
+        snprintf(msg, sizeof(msg), "ivf_scan top-k executes (%s/%s)", type, distance);
+        ASSERT(rc == SQLITE_OK, msg);
+        if (err) { printf("  err: %s\n", err); sqlite3_free(err); }
+
+        snprintf(msg, sizeof(msg), "ivf_scan top-k returns 3 rows (%s/%s)", type, distance);
+        ASSERT(r.count == 3, msg);
+
+        if (!is_dot) {
+            int all_non_neg = 1;
+            for (int i = 0; i < r.count; i++) {
+                if (r.distances[i] < 0) all_non_neg = 0;
+            }
+            snprintf(msg, sizeof(msg), "ivf_scan top-k distances >= 0 (%s/%s)", type, distance);
+            ASSERT(all_non_neg, msg);
+        }
+
+        int sorted = 1;
+        for (int i = 1; i < r.count; i++) {
+            if (r.distances[i] < r.distances[i - 1]) sorted = 0;
+        }
+        snprintf(msg, sizeof(msg), "ivf_scan top-k distances sorted (%s/%s)", type, distance);
+        ASSERT(sorted, msg);
+    }
+
+    /* Streaming mode */
+    {
+        scan_result r = {0};
+        snprintf(sql, sizeof(sql),
+                 "SELECT id, distance FROM vector_ivf_scan('%s', 'v', vector_as_%s('%s')) LIMIT 5;",
+                 tbl, type, query_vec);
+        char *err = NULL;
+        int rc = sqlite3_exec(db, sql, scan_cb, &r, &err);
+        snprintf(msg, sizeof(msg), "ivf_scan stream executes (%s/%s)", type, distance);
+        ASSERT(rc == SQLITE_OK, msg);
+        if (err) { printf("  err: %s\n", err); sqlite3_free(err); }
+
+        snprintf(msg, sizeof(msg), "ivf_scan stream returns rows (%s/%s)", type, distance);
+        ASSERT(r.count > 0, msg);
+    }
+
+    /* Cleanup */
+    snprintf(sql, sizeof(sql),
+             "SELECT vector_ivf_cleanup('%s', 'v');", tbl);
+    exec_sql(db, sql);
+}
+
 /* ---------- Test vectors ---------- */
 
 /* 4-dimensional float vectors for numeric types */
@@ -480,7 +570,22 @@ int main(void) {
         }
     }
 
-    /* 5. Backward-compat aliases */
+    /* 5. vector_ivf_scan — float types x L2, COSINE + integer types x L2 */
+    printf("\n=== vector_ivf_scan ===\n");
+    {
+        const char *float_types[] = {"f32", "f16", "bf16"};
+        const char *distances[] = {"L2", "COSINE"};
+        for (int t = 0; t < 3; t++)
+            for (int d = 0; d < 2; d++)
+                test_ivf_scan(db, float_types[t], distances[d], 4, float_vecs, float_nvecs, float_query);
+
+        /* Integer types x L2 */
+        const char *int_types[] = {"i8", "u8"};
+        for (int t = 0; t < 2; t++)
+            test_ivf_scan(db, int_types[t], "L2", 4, int_vecs, int_nvecs, int_query);
+    }
+
+    /* 6. Backward-compat aliases */
     printf("\n=== Backward-compat aliases ===\n");
     {
         /* Set up a table for alias tests */
