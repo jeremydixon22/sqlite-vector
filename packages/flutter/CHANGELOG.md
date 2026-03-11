@@ -1,3 +1,8 @@
+## Unreleased
+
+- Fix Flutter iOS simulator native-asset packaging by emitting an
+  architecture-specific dylib for each simulator target.
+
 ## 0.9.85
 
 - Initial release.
