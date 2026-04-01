@@ -185,7 +185,7 @@ endef
 LIB_NAMES = ios.dylib ios-sim.dylib macos.dylib
 FMWK_NAMES = ios-arm64 ios-arm64_x86_64-simulator macos-arm64_x86_64
 $(DIST_DIR)/%.xcframework: $(LIB_NAMES)
-	@$(foreach i,1 2 3,\
+	@$(foreach i,1 2,\
 		lib=$(word $(i),$(LIB_NAMES)); \
 		fmwk=$(word $(i),$(FMWK_NAMES)); \
 		mkdir -p $(DIST_DIR)/$$fmwk/vector.framework/Headers; \
@@ -196,6 +196,21 @@ $(DIST_DIR)/%.xcframework: $(LIB_NAMES)
 		mv $(DIST_DIR)/$$lib $(DIST_DIR)/$$fmwk/vector.framework/vector; \
 		install_name_tool -id "@rpath/vector.framework/vector" $(DIST_DIR)/$$fmwk/vector.framework/vector; \
 	)
+	@lib=$(word 3,$(LIB_NAMES)); \
+	fmwk=$(word 3,$(FMWK_NAMES)); \
+	mkdir -p $(DIST_DIR)/$$fmwk/vector.framework/Versions/A/Headers; \
+	mkdir -p $(DIST_DIR)/$$fmwk/vector.framework/Versions/A/Modules; \
+	mkdir -p $(DIST_DIR)/$$fmwk/vector.framework/Versions/A/Resources; \
+	cp src/sqlite-vector.h $(DIST_DIR)/$$fmwk/vector.framework/Versions/A/Headers; \
+	printf "$(PLIST)" > $(DIST_DIR)/$$fmwk/vector.framework/Versions/A/Resources/Info.plist; \
+	printf "$(MODULEMAP)" > $(DIST_DIR)/$$fmwk/vector.framework/Versions/A/Modules/module.modulemap; \
+	mv $(DIST_DIR)/$$lib $(DIST_DIR)/$$fmwk/vector.framework/Versions/A/vector; \
+	install_name_tool -id "@rpath/vector.framework/vector" $(DIST_DIR)/$$fmwk/vector.framework/Versions/A/vector; \
+	ln -sf A $(DIST_DIR)/$$fmwk/vector.framework/Versions/Current; \
+	ln -sf Versions/Current/vector $(DIST_DIR)/$$fmwk/vector.framework/vector; \
+	ln -sf Versions/Current/Headers $(DIST_DIR)/$$fmwk/vector.framework/Headers; \
+	ln -sf Versions/Current/Modules $(DIST_DIR)/$$fmwk/vector.framework/Modules; \
+	ln -sf Versions/Current/Resources $(DIST_DIR)/$$fmwk/vector.framework/Resources;
 	xcodebuild -create-xcframework $(foreach fmwk,$(FMWK_NAMES),-framework $(DIST_DIR)/$(fmwk)/vector.framework) -output $@
 	rm -rf $(foreach fmwk,$(FMWK_NAMES),$(DIST_DIR)/$(fmwk))
 

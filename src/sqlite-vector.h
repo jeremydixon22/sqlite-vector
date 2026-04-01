@@ -24,7 +24,7 @@
 extern "C" {
 #endif
 
-#define SQLITE_VECTOR_VERSION "0.9.93"
+#define SQLITE_VECTOR_VERSION "0.9.94"
 
 SQLITE_VECTOR_API int sqlite3_vector_init (sqlite3 *db, char **pzErrMsg, const sqlite3_api_routines *pApi);
 
