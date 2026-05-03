@@ -101,7 +101,7 @@ SELECT vector_init('documents', 'embedding', 'dimension=384,type=FLOAT32,distanc
 **Returns:** `INTEGER`
 
 **Description:**
-Returns the total number of succesfully quantized rows.
+Returns the total number of successfully quantized rows.
 
 Performs quantization on the specified table and column. This precomputes internal data structures to support fast approximate nearest neighbor (ANN) search.
 Read more about quantization [here](https://github.com/sqliteai/sqlite-vector/blob/main/QUANTIZATION.md).
