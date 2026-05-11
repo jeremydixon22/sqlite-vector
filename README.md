@@ -1,3 +1,41 @@
+<div align="center">
+  <a href="https://sqlite.ai">
+    <img src="https://www.sqlite.ai/social/logo-ai.png" alt="SQLite AI" height="56">
+  </a>
+
+  <h1>SQLite-Vector</h1>
+  <p><strong>Production-grade vector search inside SQLite.</strong><br>
+  Sub-millisecond ANN queries, 200KB binary, zero dependencies — runs anywhere SQLite runs: mobile, browser, edge, server.</p>
+
+  <p>
+    <a href="https://dashboard.sqlitecloud.io/auth/sign-in"><strong>Free managed instance →</strong></a> ·
+    <a href="https://docs.sqlitecloud.io/docs/ai-overview">Docs</a> ·
+    <a href="https://sqlite.ai">Website</a> ·
+    <a href="https://blog.sqlite.ai">Blog</a>
+  </p>
+
+  <p>
+    <sub><strong>Data:</strong>
+    <a href="https://github.com/sqliteai/sqlite-vector">Vector</a> ·
+    <a href="https://github.com/sqliteai/sqlite-sync">Sync</a> ·
+    <a href="https://github.com/sqliteai/sqlite-columnar">Columnar</a> ·
+    <a href="https://github.com/sqliteai/sqlite-js">JS</a>
+    <br>
+    <strong>AI:</strong>
+    <a href="https://github.com/sqliteai/sqlite-ai">AI</a> ·
+    <a href="https://github.com/sqliteai/sqlite-agent">Agent</a> ·
+    <a href="https://github.com/sqliteai/sqlite-memory">Memory</a> ·
+    <a href="https://github.com/sqliteai/sqlite-mcp">MCP</a>
+    </sub>
+  </p>
+</div>
+
+<br>
+
+> **Building RAG or semantic search?** SQLite-Vector ships as an extension you can drop into any SQLite app. Need it managed with sync and auth? **[SQLite Cloud free tier](https://dashboard.sqlitecloud.io/auth/sign-in)** gives you 512 MB and 20 connections, no credit card.
+
+---
+
 # SQLite Vector
 
 **SQLite Vector** is a cross-platform, ultra-efficient SQLite extension that brings vector search capabilities to your embedded database. It works seamlessly on **iOS, Android, Windows, Linux, and macOS**, using just **30MB of memory** by default. With support for **Float32, Float16, BFloat16, Int8, UInt8 and 1Bit**, and **highly optimized distance functions**, it's the ideal solution for **Edge AI** applications.
@@ -257,19 +295,32 @@ Free Use in Open-Source Projects: You may use, copy, distribute, and prepare der
 
 ---
 
-## Part of the SQLite AI Ecosystem
 
-This project is part of the **SQLite AI** ecosystem, a collection of extensions that bring modern AI capabilities to the world’s most widely deployed database. The goal is to make SQLite the default data and inference engine for Edge AI applications.
+## ☁️ Hosted version
 
-Other projects in the ecosystem include:
+Don't want to run it yourself? **[SQLite Cloud](https://sqlite.ai)** is the managed version of SQLite-Vector and the rest of the stack — with sync, backups, auth, edge functions, and multi-region support included.
 
-- **[SQLite-AI](https://github.com/sqliteai/sqlite-ai)** — On-device inference and embedding generation directly inside SQLite.
-- **[SQLite-Memory](https://github.com/sqliteai/sqlite-memory)** — Markdown-based AI agent memory with semantic search.
-- **[SQLite-Vector](https://github.com/sqliteai/sqlite-vector)** — Ultra-efficient vector search for embeddings stored as BLOBs in standard SQLite tables.
-- **[SQLite-Sync](https://github.com/sqliteai/sqlite-sync)** — Local-first CRDT-based synchronization for seamless, conflict-free data sync and real-time collaboration across devices.
-- **[SQLite-Agent](https://github.com/sqliteai/sqlite-agent)** — Run autonomous AI agents directly from within SQLite databases.
-- **[SQLite-MCP](https://github.com/sqliteai/sqlite-mcp)** — Connect SQLite databases to MCP servers and invoke their tools.
-- **[SQLite-JS](https://github.com/sqliteai/sqlite-js)** — Create custom SQLite functions using JavaScript.
-- **[Liteparser](https://github.com/sqliteai/liteparser)** — A highly efficient and fully compliant SQLite SQL parser.
+[**Start free →**](https://dashboard.sqlitecloud.io/auth/sign-in)
 
-Learn more at **[SQLite AI](https://sqlite.ai)**.
+---
+
+## Part of the SQLite AI stack
+
+SQLite-Vector is one piece of a larger ecosystem that turns SQLite into a runtime for intelligent, distributed data:
+
+**Data layer**
+- [**sqlite-vector**](https://github.com/sqliteai/sqlite-vector) — ANN vector search inside SQLite *(you are here)*
+- [sqlite-sync](https://github.com/sqliteai/sqlite-sync) — Offline-first CRDT sync across devices
+- [sqlite-columnar](https://github.com/sqliteai/sqlite-columnar) — Column-oriented analytics for OLAP queries
+- [sqlite-js](https://github.com/sqliteai/sqlite-js) — Custom SQLite functions written in JavaScript
+
+**AI layer**
+- [sqlite-ai](https://github.com/sqliteai/sqlite-ai) — On-device LLM inference and embeddings
+- [sqlite-agent](https://github.com/sqliteai/sqlite-agent) — Autonomous AI agents running inside SQLite
+- [sqlite-memory](https://github.com/sqliteai/sqlite-memory) — Persistent, searchable memory for agents
+- [sqlite-mcp](https://github.com/sqliteai/sqlite-mcp) — Call MCP tools directly from SQL queries
+
+**Managed platform**
+- [SQLite Cloud](https://sqlite.ai) — Hosted SQLite with sync, auth, edge functions, and analytics. [Free tier →](https://dashboard.sqlitecloud.io/auth/sign-in)
+
+Built by [SQLite AI](https://sqlite.ai). Questions? [Contact us](https://sqlite.ai/support).
