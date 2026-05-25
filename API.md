@@ -39,13 +39,31 @@ Returns the active backend used for vector computation. This indicates the SIMD 
 * `CPU` – Generic fallback
 * `SSE2` – SIMD on Intel/AMD
 * `AVX2` – Advanced SIMD on modern x86 CPUs
+* `AVX512` – Wide SIMD on supported x86 CPUs
 * `NEON` – SIMD on ARM (e.g., mobile)
+* `RVV` – SIMD on supported RISC-V CPUs
 
 **Example:**
 
 ```sql
 SELECT vector_backend();
 -- e.g., 'AVX2'
+```
+
+---
+
+## `vector_turboquant_backend()`
+
+**Returns:** `TEXT`
+
+**Description:**
+Returns the active backend used by TurboQuant lookup-table scans. This is useful when validating that TurboQuant is using the expected SIMD path on a target runtime.
+
+**Example:**
+
+```sql
+SELECT vector_turboquant_backend();
+-- e.g., 'NEON'
 ```
 
 ---
@@ -117,13 +135,16 @@ If a quantization already exists for the specified table and column, it is repla
 **Available options:**
 
 * `max_memory`: Max memory to use for quantization (default: 30MB)
-* `qtype`: Quantization type: `UINT8`, `INT8` or `1BIT`
+* `qtype`: Quantization type: `UINT8`, `INT8`, `1BIT`, `TURBO`, `TURBO2`, `TURBO3`, or `TURBO4`
+* `qbits`: TurboQuant bit width (`2`, `3`, or `4`). Defaults to `4` when `qtype=TURBO`.
 
 **Example:**
 
 ```sql
 SELECT vector_quantize('documents', 'embedding', 'max_memory=50MB');
 SELECT vector_quantize('documents', 'embedding', 'qtype=BIT');
+SELECT vector_quantize('documents', 'embedding', 'qtype=TURBO,qbits=4');
+SELECT vector_quantize('documents', 'embedding', 'qtype=TURBO2');
 ```
 
 ---
@@ -281,9 +302,9 @@ You **must run `vector_quantize()`** before using `vector_quantize_scan()` and w
 
 **Performance Highlights:**
 
-* Handles **1M vectors** of dimension 768 in a few milliseconds.
-* Uses **<50MB** of RAM.
-* Achieves **>0.95 recall**.
+* Supports compact SIMD 2-, 3-, and 4-bit TurboQuant scans for high-dimensional vectors.
+* `qbits=2` minimizes memory; `qbits=4` usually gives the better recall/speed balance.
+* Recall depends on the dataset, distance function, bit width, and `k`; validate it against `vector_full_scan()` for your workload.
 
 **Examples:**
 

@@ -16,12 +16,23 @@ This can result in a **4×–5× speedup** on nearest neighbor queries while kee
 
 #### What is Quantization?
 
-Quantization compresses high-dimensional float vectors (e.g., `FLOAT32`) into compact representations using lower-precision formats (e.g., `UINT8`). This drastically reduces the size of the data—often by a factor of 4 to 8—making it practical to load large datasets entirely in memory, even on edge devices.
+Quantization compresses high-dimensional vectors into compact representations using lower-precision formats such as `UINT8`, `INT8`, `1BIT`, and TurboQuant (`TURBO`). TurboQuant supports 2-, 3-, and 4-bit scalar codes plus one scale per vector, which is useful for large edge-oriented datasets where raw `FLOAT32` storage is too large.
+
+```sql
+-- Default quantization.
+SELECT vector_quantize('my_table', 'my_column');
+
+-- TurboQuant, 4 bits per dimension.
+SELECT vector_quantize('my_table', 'my_column', 'qtype=TURBO,qbits=4');
+
+-- TurboQuant shorthand for 2 bits per dimension.
+SELECT vector_quantize('my_table', 'my_column', 'qtype=TURBO2');
+```
 
 #### Why is it Important?
 
-* **Faster Searches**: With preloaded quantized vectors, distance computations are up to 5× faster.
-* **Lower Memory Footprint**: Quantized vectors use significantly less RAM, allowing millions of vectors to fit in memory.
+* **Faster Searches**: With quantized vectors, distance computations can be several times faster than brute force.
+* **Lower Memory Footprint**: Quantized vectors use significantly less RAM and disk than raw vectors, allowing millions of vectors to fit in constrained environments.
 * **Edge-ready**: The reduced size and in-memory access make this ideal for mobile, embedded, and on-device AI applications.
 
 #### Estimate Memory Usage
@@ -33,10 +44,11 @@ SELECT vector_quantize_memory('my_table', 'my_column');
 ```
 
 This gives you an approximate number of bytes needed to load the quantized vectors into memory.
+For TurboQuant, the scan representation is approximately `rows * (8 + 4 + ceil(dimension * qbits / 8))` bytes before allocator overhead and SQLite page/cache effects. You can skip `vector_quantize_preload()` to keep the quantized data on disk and reduce resident memory, at the cost of more SQLite page reads during scans.
 
 #### Accuracy You Can Trust
 
-Despite the compression, our quantization algorithms are finely tuned to maintain high accuracy. You can expect **recall rates greater than 0.95**, ensuring that approximate searches closely match exact results in quality.
+Despite the compression, quantization is approximate. Recall depends on the dataset, vector dimensionality, distance function, bit width, and requested `k`. TurboQuant scans use SIMD lookup-table kernels where available. Prefer `qbits=4` when recall is the priority and `qbits=2` when memory is the primary constraint.
 
 #### Measuring Recall in SQLite-Vector
 
@@ -74,3 +86,5 @@ SELECT
 
 Where `?1` is the input vector (as a BLOB) and `?2` is the number of nearest neighbors `k`.
 This query compares exact and quantized results and computes the recall ratio, helping you validate the quality of quantized search.
+
+For a reproducible real-dataset run, use `test/recall_turboquant_real.py`. It downloads the Fashion-MNIST ANN-Benchmarks HDF5 dataset, loads a configurable subset into SQLite, and reports recall@k for TurboQuant 2/3/4-bit against `vector_full_scan()`.

@@ -192,6 +192,10 @@ jobs:
         if: contains(matrix.name, 'linux') || matrix.name == 'windows' || ( matrix.name == 'macos' && matrix.arch != 'x86_64' )
         run: ${{ matrix.name == 'linux-musl' && matrix.arch == 'arm64' && 'docker exec alpine' || '' }} make test ${{ matrix.make && matrix.make || ''}}
 
+      - name: unit test sqlite-vector
+        if: contains(matrix.name, 'linux') || ( matrix.name == 'macos' && matrix.arch != 'x86_64' )
+        run: ${{ matrix.name == 'linux-musl' && matrix.arch == 'arm64' && 'docker exec alpine' || '' }} make unittest ${{ matrix.make && matrix.make || ''}}
+
       - uses: actions/upload-artifact@v4.6.2
         if: always()
         with:

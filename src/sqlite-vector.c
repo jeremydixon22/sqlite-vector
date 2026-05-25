@@ -44,7 +44,6 @@ char *strcasestr(const char *haystack, const char *needle) {
 }
 #endif
 
-
 #ifdef SQLITE_WASM_EXTRA_INIT
 #define sqlite3_mutex_alloc(_type)                  NULL
 #define sqlite3_mutex_enter(_mutex)
@@ -115,10 +114,13 @@ SQLITE_EXTENSION_INIT1
 #define OPTION_KEY_MAXMEMORY                        "max_memory"
 #define OPTION_KEY_DISTANCE                         "distance"
 #define OPTION_KEY_QUANTTYPE                        "qtype"
+#define OPTION_KEY_QUANTBITS                        "qbits"
 #define OPTION_KEY_QUANTSCALE                       "qscale"        // used only in serialize/unserialize
 #define OPTION_KEY_QUANTOFFSET                      "qoffset"       // used only in serialize/unserialize
 
 #define VECTOR_INTERNAL_TABLE                       "CREATE TABLE IF NOT EXISTS _sqliteai_vector (tblname TEXT, colname TEXT, key TEXT, value ANY, PRIMARY KEY(tblname, colname, key));"
+
+typedef struct turbo_rotation_plan turbo_rotation_plan;
 
 typedef struct {
     vector_type     v_type;                 // vector type
@@ -127,6 +129,7 @@ typedef struct {
     vector_distance v_distance;             // vector distance function
     
     vector_qtype    q_type;                 // quantization type
+    int             q_bits;                 // bit width for TurboQuant
     uint64_t        max_memory;             // max memory
 } vector_options;
 
@@ -142,6 +145,15 @@ typedef struct {
     
     void            *preloaded;
     int             precounter;
+    sqlite3_int64   preloaded_bytes;
+
+    turbo_rotation_plan *turbo_plan;
+    int             turbo_plan_dim;
+    bool            turbo_codebook_ready;
+    int             turbo_codebook_dim;
+    int             turbo_codebook_bits;
+    float           turbo_boundaries[15];
+    float           turbo_centroids[16];
 } table_context;
 
 typedef struct {
@@ -176,6 +188,12 @@ typedef struct {
         int                 dcounter;
         int                 dindex;
         int                 is_eof;
+        float               turbo_qnorm_sq;
+        int                 turbo_bits;
+        sqlite3_int64       data_bytes;
+        float               *turbo_query_lut;
+        float               *turbo_norm_lut;
+        int                 turbo_lut_rows;
     } stream;
     
     // NON-STREAMING VT INTERFACE
@@ -193,6 +211,7 @@ typedef int (*vcursor_sort_callback)(vFullScanCursor *c);
 
 extern distance_function_t dispatch_distance_table[VECTOR_DISTANCE_MAX][VECTOR_TYPE_MAX];
 extern const char *distance_backend_name;
+extern const char *turbo_lut_backend_name;
 
 static sqlite3_mutex *qmutex;
 
@@ -480,6 +499,11 @@ static int sqlite_unserialize (sqlite3_context *context, table_context *ctx) {
         const char *key = (const char *)sqlite3_column_text(vm, 0);
         if (strcmp(key, OPTION_KEY_QUANTTYPE) == 0) {
             ctx->options.q_type = (vector_qtype)sqlite3_column_int(vm, 1);
+            continue;
+        }
+
+        if (strcmp(key, OPTION_KEY_QUANTBITS) == 0) {
+            ctx->options.q_bits = sqlite3_column_int(vm, 1);
             continue;
         }
         
@@ -845,6 +869,494 @@ static void quantize_binary_i8 (const int8_t *input, uint8_t *output, int dim) {
     }
 }
 
+// MARK: - TurboQuant -
+
+static inline size_t turbo_bytes_for_dim (int dim, int bits) {
+    return ((size_t)dim * (size_t)bits + 7u) / 8u;
+}
+
+static inline uint64_t turbo_splitmix64 (uint64_t *state) {
+    uint64_t z = (*state += 0x9E3779B97F4A7C15ull);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    return z ^ (z >> 31);
+}
+
+struct turbo_rotation_plan {
+    int dim;
+    int rounds;
+    int pair_count;
+    uint8_t *signs;
+    int *a;
+    int *b;
+    float *s;
+    float *c;
+};
+
+static void turbo_rotation_plan_free (turbo_rotation_plan *plan) {
+    if (!plan) return;
+    if (plan->signs) sqlite3_free(plan->signs);
+    if (plan->a) sqlite3_free(plan->a);
+    if (plan->b) sqlite3_free(plan->b);
+    if (plan->s) sqlite3_free(plan->s);
+    if (plan->c) sqlite3_free(plan->c);
+    memset(plan, 0, sizeof(*plan));
+}
+
+static int turbo_rotation_plan_init (turbo_rotation_plan *plan, int dim) {
+    memset(plan, 0, sizeof(*plan));
+    plan->dim = dim;
+    plan->rounds = 12;
+    int pairs_per_round = dim / 2;
+    plan->pair_count = pairs_per_round * plan->rounds;
+
+    plan->signs = (uint8_t *)sqlite3_malloc64((sqlite3_uint64)dim);
+    if (plan->pair_count > 0) {
+        plan->a = (int *)sqlite3_malloc64((sqlite3_uint64)plan->pair_count * sizeof(int));
+        plan->b = (int *)sqlite3_malloc64((sqlite3_uint64)plan->pair_count * sizeof(int));
+        plan->s = (float *)sqlite3_malloc64((sqlite3_uint64)plan->pair_count * sizeof(float));
+        plan->c = (float *)sqlite3_malloc64((sqlite3_uint64)plan->pair_count * sizeof(float));
+    }
+    if (!plan->signs || (plan->pair_count > 0 && (!plan->a || !plan->b || !plan->s || !plan->c))) {
+        turbo_rotation_plan_free(plan);
+        return SQLITE_NOMEM;
+    }
+
+    uint64_t sign_state = 0xA5A5A5A55A5A5A5Aull ^ (uint64_t)dim;
+    for (int i = 0; i < dim; ++i) plan->signs[i] = (uint8_t)(turbo_splitmix64(&sign_state) & 1ull);
+
+    int *perm = (int *)sqlite3_malloc64((sqlite3_uint64)dim * sizeof(int));
+    if (!perm) {
+        turbo_rotation_plan_free(plan);
+        return SQLITE_NOMEM;
+    }
+
+    int idx = 0;
+    for (int r = 0; r < plan->rounds; ++r) {
+        for (int i = 0; i < dim; ++i) perm[i] = i;
+        uint64_t state = 0xD1B54A32D192ED03ull ^ ((uint64_t)dim << 32) ^ (uint64_t)r;
+        for (int i = dim - 1; i > 0; --i) {
+            int j = (int)(turbo_splitmix64(&state) % (uint64_t)(i + 1));
+            int tmp = perm[i];
+            perm[i] = perm[j];
+            perm[j] = tmp;
+        }
+
+        for (int i = 0; i + 1 < dim; i += 2) {
+            uint64_t rnd = turbo_splitmix64(&state);
+            float angle = (float)((double)(rnd >> 11) * (6.28318530717958647692 / 9007199254740992.0));
+            plan->a[idx] = perm[i];
+            plan->b[idx] = perm[i + 1];
+            plan->s[idx] = sinf(angle);
+            plan->c[idx] = cosf(angle);
+            idx++;
+        }
+    }
+    sqlite3_free(perm);
+    return SQLITE_OK;
+}
+
+static float turbo_value_at (const void *v, vector_type type, int i) {
+    switch (type) {
+        case VECTOR_TYPE_F32: return ((const float *)v)[i];
+        case VECTOR_TYPE_F16: return float16_to_float32(((const uint16_t *)v)[i]);
+        case VECTOR_TYPE_BF16: return bfloat16_to_float32(((const uint16_t *)v)[i]);
+        case VECTOR_TYPE_U8: return (float)((const uint8_t *)v)[i];
+        case VECTOR_TYPE_I8: return (float)((const int8_t *)v)[i];
+        case VECTOR_TYPE_BIT: return (float)((((const uint8_t *)v)[i / 8] >> (i % 8)) & 1);
+    }
+    return 0.0f;
+}
+
+static float turbo_copy_float (const void *v, vector_type type, int dim, float *out) {
+    double norm_sq = 0.0;
+    for (int i = 0; i < dim; ++i) {
+        float x = turbo_value_at(v, type, i);
+        out[i] = x;
+        norm_sq += (double)x * (double)x;
+    }
+    return (float)norm_sq;
+}
+
+static void turbo_normalize_inplace (float *v, int dim, float norm_sq) {
+    if (norm_sq <= 1e-20f) {
+        memset(v, 0, (size_t)dim * sizeof(float));
+        return;
+    }
+    float inv = 1.0f / sqrtf(norm_sq);
+    for (int i = 0; i < dim; ++i) v[i] *= inv;
+}
+
+static void turbo_rotate_with_plan (const float *input, float *output, const turbo_rotation_plan *plan) {
+    int dim = plan->dim;
+    memcpy(output, input, (size_t)dim * sizeof(float));
+    if (dim <= 1) return;
+
+    for (int i = 0; i < dim; ++i) if (plan->signs[i]) output[i] = -output[i];
+
+    for (int i = 0; i < plan->pair_count; ++i) {
+        int a = plan->a[i];
+        int b = plan->b[i];
+        float s = plan->s[i];
+        float c = plan->c[i];
+        float x = output[a];
+        float y = output[b];
+        output[a] = c * x - s * y;
+        output[b] = s * x + c * y;
+    }
+}
+
+static inline double turbo_normal_pdf (double z) {
+    return 0.39894228040143267794 * exp(-0.5 * z * z);
+}
+
+static inline double turbo_normal_cdf (double z) {
+    return 0.5 * erfc(-z * 0.70710678118654752440);
+}
+
+static double turbo_beta_pdf_shifted (double x, int dim) {
+    if (x <= -1.0 || x >= 1.0 || dim <= 1) return 0.0;
+    double a = ((double)dim - 1.0) * 0.5;
+    double y = (x + 1.0) * 0.5;
+    double log_pdf = (a - 1.0) * (log(y) + log1p(-y)) + lgamma(2.0 * a) - 2.0 * lgamma(a) - log(2.0);
+    return exp(log_pdf);
+}
+
+static void turbo_beta_interval_moments (double lo, double hi, int dim, double *prob_out, double *moment_out) {
+    static const double nodes[16] = {
+        0.048307665687738316,
+        0.14447196158279649,
+        0.23928736225213707,
+        0.33186860228212767,
+        0.42135127613063533,
+        0.50689990893222939,
+        0.58771575724076233,
+        0.66304426693021520,
+        0.73218211874028968,
+        0.79448379596794241,
+        0.84936761373256997,
+        0.89632115576605212,
+        0.93490607593773969,
+        0.96476225558750643,
+        0.98561151154526834,
+        0.99726386184948156
+    };
+    static const double weights[16] = {
+        0.09654008851472780,
+        0.09563872007927486,
+        0.09384439908080457,
+        0.09117387869576388,
+        0.08765209300440381,
+        0.08331192422694676,
+        0.07819389578707031,
+        0.07234579410884851,
+        0.06582222277636185,
+        0.05868409347853555,
+        0.05099805926237618,
+        0.04283589802222668,
+        0.03427386291302143,
+        0.02539206530926206,
+        0.01627439473090567,
+        0.00701861000947010
+    };
+
+    if (lo < -1.0) lo = -1.0;
+    if (hi > 1.0) hi = 1.0;
+    if (hi <= lo) {
+        *prob_out = 0.0;
+        *moment_out = 0.0;
+        return;
+    }
+
+    double mid = 0.5 * (lo + hi);
+    double half = 0.5 * (hi - lo);
+    double prob = 0.0;
+    double moment = 0.0;
+    for (int i = 0; i < 16; ++i) {
+        double dx = half * nodes[i];
+        double x1 = mid - dx;
+        double x2 = mid + dx;
+        double p1 = turbo_beta_pdf_shifted(x1, dim);
+        double p2 = turbo_beta_pdf_shifted(x2, dim);
+        prob += weights[i] * (p1 + p2);
+        moment += weights[i] * (x1 * p1 + x2 * p2);
+    }
+
+    *prob_out = half * prob;
+    *moment_out = half * moment;
+}
+
+static void turbo_make_codebook (int bits, int dim, float *boundaries, float *centroids) {
+    int levels = 1 << bits;
+    double c[16];
+    double next[16];
+    double sigma = (dim > 0) ? 1.0 / sqrt((double)dim) : 1.0;
+
+    for (int i = 0; i < levels; ++i) {
+        c[i] = (-3.0 + 6.0 * (double)i / (double)(levels - 1)) * sigma;
+    }
+
+    if (dim <= 1) {
+        for (int it = 0; it < 80; ++it) {
+            double max_change = 0.0;
+            for (int i = 0; i < levels; ++i) {
+                double lo = (i == 0) ? -INFINITY : 0.5 * (c[i - 1] + c[i]);
+                double hi = (i == levels - 1) ? INFINITY : 0.5 * (c[i] + c[i + 1]);
+                double zl = lo / sigma;
+                double zh = hi / sigma;
+                double p = turbo_normal_cdf(zh) - turbo_normal_cdf(zl);
+                if (p <= 1e-15) {
+                    next[i] = c[i];
+                } else {
+                    double pdf_lo = isinf(zl) ? 0.0 : turbo_normal_pdf(zl);
+                    double pdf_hi = isinf(zh) ? 0.0 : turbo_normal_pdf(zh);
+                    next[i] = sigma * (pdf_lo - pdf_hi) / p;
+                }
+                double change = fabs(next[i] - c[i]);
+                if (change > max_change) max_change = change;
+            }
+            memcpy(c, next, (size_t)levels * sizeof(double));
+            if (max_change < 1e-12) break;
+        }
+
+        for (int i = 0; i < levels - 1; ++i) boundaries[i] = (float)(0.5 * (c[i] + c[i + 1]));
+        for (int i = 0; i < levels; ++i) centroids[i] = (float)c[i];
+        return;
+    }
+
+    for (int it = 0; it < 200; ++it) {
+        double max_change = 0.0;
+        for (int i = 0; i < levels; ++i) {
+            double lo = (i == 0) ? -1.0 : 0.5 * (c[i - 1] + c[i]);
+            double hi = (i == levels - 1) ? 1.0 : 0.5 * (c[i] + c[i + 1]);
+            double p = 0.0;
+            double moment = 0.0;
+            turbo_beta_interval_moments(lo, hi, dim, &p, &moment);
+            if (p <= 1e-15) {
+                next[i] = c[i];
+            } else {
+                next[i] = moment / p;
+            }
+            double change = fabs(next[i] - c[i]);
+            if (change > max_change) max_change = change;
+        }
+        memcpy(c, next, (size_t)levels * sizeof(double));
+        if (max_change < 1e-12) break;
+    }
+
+    for (int i = 0; i < levels - 1; ++i) boundaries[i] = (float)(0.5 * (c[i] + c[i + 1]));
+    for (int i = 0; i < levels; ++i) centroids[i] = (float)c[i];
+}
+
+static inline uint8_t turbo_code_for_value (float x, const float *boundaries, int bits) {
+    uint8_t code = 0;
+    int nboundaries = (1 << bits) - 1;
+    for (int i = 0; i < nboundaries; ++i) {
+        if (x > boundaries[i]) ++code;
+    }
+    return code;
+}
+
+static void turbo_quantize_rotated (const float *rotated, uint8_t *packed, const float *boundaries, const float *centroids, int bits, int dim, float *inner_out) {
+    memset(packed, 0, turbo_bytes_for_dim(dim, bits));
+
+    double inner = 0.0;
+    for (int j = 0; j < dim; ++j) {
+        uint8_t code = turbo_code_for_value(rotated[j], boundaries, bits);
+        inner += (double)rotated[j] * (double)centroids[code];
+        size_t bit_pos = (size_t)j * (size_t)bits;
+        size_t byte_pos = bit_pos / 8u;
+        int shift = (int)(bit_pos % 8u);
+        packed[byte_pos] |= (uint8_t)(code << shift);
+        if (shift + bits > 8) packed[byte_pos + 1] |= (uint8_t)(code >> (8 - shift));
+    }
+    *inner_out = (float)inner;
+}
+
+static inline uint8_t turbo_unpack_code (const uint8_t *packed, int bits, int dim, int j) {
+    (void)dim;
+    size_t bit_pos = (size_t)j * (size_t)bits;
+    size_t byte_pos = bit_pos / 8u;
+    int shift = (int)(bit_pos % 8u);
+    uint16_t value = packed[byte_pos];
+    if (shift + bits > 8) value |= (uint16_t)packed[byte_pos + 1] << 8;
+    return (uint8_t)((value >> shift) & ((1u << bits) - 1u));
+}
+
+static float turbo_distance_from_rotated_query (const float *query_rot, float query_norm_sq, const uint8_t *packed, float scale, const float *centroids, int bits, int dim, vector_distance distance) {
+    double dot = 0.0;
+    double xnorm_sq = 0.0;
+    for (int j = 0; j < dim; ++j) {
+        float c = centroids[turbo_unpack_code(packed, bits, dim, j)] * scale;
+        dot += (double)query_rot[j] * (double)c;
+        xnorm_sq += (double)c * (double)c;
+    }
+
+    switch (distance) {
+        case VECTOR_DISTANCE_DOT:
+            return (float)-dot;
+        case VECTOR_DISTANCE_COSINE: {
+            float d = (float)(1.0 - dot);
+            return d < 0.0f ? 0.0f : d;
+        }
+        case VECTOR_DISTANCE_L2: {
+            double d2 = (double)query_norm_sq + xnorm_sq - 2.0 * dot;
+            if (d2 < 0.0) d2 = 0.0;
+            return (float)sqrt(d2);
+        }
+        case VECTOR_DISTANCE_SQUARED_L2: {
+            double d2 = (double)query_norm_sq + xnorm_sq - 2.0 * dot;
+            return (float)(d2 < 0.0 ? 0.0 : d2);
+        }
+        default:
+            return INFINITY;
+    }
+}
+
+static float *turbo_build_query_lut (const float *query_rot, const float *centroids, int bits, int dim, int *lut_rows_out) {
+    if (bits < 2 || bits > 4) {
+        *lut_rows_out = 0;
+        return NULL;
+    }
+
+    int codes_per_row = (bits == 3) ? 4 : (8 / bits);
+    int entries_per_row = (bits == 3) ? 4096 : 256;
+    int rows = (dim + codes_per_row - 1) / codes_per_row;
+    float *lut = (float *)sqlite3_malloc64((sqlite3_uint64)rows * (sqlite3_uint64)entries_per_row * sizeof(float));
+    if (!lut) {
+        *lut_rows_out = 0;
+        return NULL;
+    }
+
+    uint8_t mask = (uint8_t)((1u << bits) - 1u);
+    for (int r = 0; r < rows; ++r) {
+        for (int entry = 0; entry < entries_per_row; ++entry) {
+            double sum = 0.0;
+            for (int c = 0; c < codes_per_row; ++c) {
+                int j = r * codes_per_row + c;
+                if (j >= dim) break;
+                int code = (entry >> (c * bits)) & mask;
+                sum += (double)query_rot[j] * (double)centroids[code];
+            }
+            lut[(size_t)r * (size_t)entries_per_row + (size_t)entry] = (float)sum;
+        }
+    }
+
+    *lut_rows_out = rows;
+    return lut;
+}
+
+static float *turbo_build_norm_lut (const float *centroids, int bits, int dim, int *lut_rows_out) {
+    if (bits < 2 || bits > 4) {
+        *lut_rows_out = 0;
+        return NULL;
+    }
+
+    int codes_per_row = (bits == 3) ? 4 : (8 / bits);
+    int entries_per_row = (bits == 3) ? 4096 : 256;
+    int rows = (dim + codes_per_row - 1) / codes_per_row;
+    float *lut = (float *)sqlite3_malloc64((sqlite3_uint64)rows * (sqlite3_uint64)entries_per_row * sizeof(float));
+    if (!lut) {
+        *lut_rows_out = 0;
+        return NULL;
+    }
+
+    uint8_t mask = (uint8_t)((1u << bits) - 1u);
+    for (int r = 0; r < rows; ++r) {
+        for (int entry = 0; entry < entries_per_row; ++entry) {
+            double sum = 0.0;
+            for (int c = 0; c < codes_per_row; ++c) {
+                int j = r * codes_per_row + c;
+                if (j >= dim) break;
+                int code = (entry >> (c * bits)) & mask;
+                double value = (double)centroids[code];
+                sum += value * value;
+            }
+            lut[(size_t)r * (size_t)entries_per_row + (size_t)entry] = (float)sum;
+        }
+    }
+
+    *lut_rows_out = rows;
+    return lut;
+}
+
+static inline uint16_t turbo_lut3_index (const uint8_t *packed, int row, int packed_bytes) {
+    size_t bit_pos = (size_t)row * 12u;
+    size_t byte_pos = bit_pos / 8u;
+    int shift = (int)(bit_pos % 8u);
+    uint32_t word = 0;
+    if ((int)byte_pos < packed_bytes) word |= packed[byte_pos];
+    if ((int)byte_pos + 1 < packed_bytes) word |= (uint32_t)packed[byte_pos + 1] << 8;
+    return (uint16_t)((word >> shift) & 0x0fffu);
+}
+
+static inline float turbo_dot_from_lut (const uint8_t *packed, float scale, const float *query_lut, int lut_rows, int bits, int packed_bytes) {
+    if (turbo_lut_dot_function) return turbo_lut_dot_function(packed, scale, query_lut, lut_rows, bits, packed_bytes);
+    double dot = 0.0;
+    if (bits == 3) {
+        for (int r = 0; r < lut_rows; ++r) {
+            dot += (double)query_lut[(size_t)r * 4096u + turbo_lut3_index(packed, r, packed_bytes)];
+        }
+    } else {
+        for (int r = 0; r < lut_rows; ++r) {
+            dot += (double)query_lut[(size_t)r * 256u + packed[r]];
+        }
+    }
+    return (float)(dot * (double)scale);
+}
+
+static int table_context_ensure_turbo_plan (table_context *t_ctx, int dim) {
+    if (t_ctx->turbo_plan && t_ctx->turbo_plan_dim == dim) return SQLITE_OK;
+
+    if (t_ctx->turbo_plan) {
+        turbo_rotation_plan_free(t_ctx->turbo_plan);
+        sqlite3_free(t_ctx->turbo_plan);
+        t_ctx->turbo_plan = NULL;
+        t_ctx->turbo_plan_dim = 0;
+    }
+
+    turbo_rotation_plan *plan = (turbo_rotation_plan *)sqlite3_malloc64(sizeof(turbo_rotation_plan));
+    if (!plan) return SQLITE_NOMEM;
+    int rc = turbo_rotation_plan_init(plan, dim);
+    if (rc != SQLITE_OK) {
+        sqlite3_free(plan);
+        return rc;
+    }
+
+    t_ctx->turbo_plan = plan;
+    t_ctx->turbo_plan_dim = dim;
+    return SQLITE_OK;
+}
+
+static int table_context_ensure_turbo_codebook (table_context *t_ctx, int bits, int dim) {
+    if (bits < 2 || bits > 4) return SQLITE_MISUSE;
+    if (t_ctx->turbo_codebook_ready && t_ctx->turbo_codebook_bits == bits && t_ctx->turbo_codebook_dim == dim) return SQLITE_OK;
+
+    turbo_make_codebook(bits, dim, t_ctx->turbo_boundaries, t_ctx->turbo_centroids);
+    t_ctx->turbo_codebook_ready = true;
+    t_ctx->turbo_codebook_bits = bits;
+    t_ctx->turbo_codebook_dim = dim;
+    return SQLITE_OK;
+}
+
+static int table_context_require_turbo_cache (table_context *t_ctx, int bits, int dim) {
+    if (!t_ctx->turbo_plan || t_ctx->turbo_plan_dim != dim) return SQLITE_MISUSE;
+    if (!t_ctx->turbo_codebook_ready || t_ctx->turbo_codebook_bits != bits || t_ctx->turbo_codebook_dim != dim) return SQLITE_MISUSE;
+    return SQLITE_OK;
+}
+
+static void table_context_free_turbo_cache (table_context *t_ctx) {
+    if (t_ctx->turbo_plan) {
+        turbo_rotation_plan_free(t_ctx->turbo_plan);
+        sqlite3_free(t_ctx->turbo_plan);
+    }
+    t_ctx->turbo_plan = NULL;
+    t_ctx->turbo_plan_dim = 0;
+    t_ctx->turbo_codebook_ready = false;
+    t_ctx->turbo_codebook_dim = 0;
+    t_ctx->turbo_codebook_bits = 0;
+}
+
 // MARK: - General Utils -
 
 static int vector_type_to_size (vector_type type) {
@@ -893,6 +1405,7 @@ static vector_qtype quant_name_to_type (const char *qname) {
     if (strcasecmp(qname, "UINT8") == 0) return VECTOR_QUANT_U8BIT;
     if (strcasecmp(qname, "INT8") == 0) return VECTOR_QUANT_S8BIT;
     if (strcasecmp(qname, "1BIT") == 0 || strcasecmp(qname, "BIT") == 0 || strcasecmp(qname, "BINARY") == 0) return VECTOR_QUANT_1BIT;
+    if (strcasecmp(qname, "TURBO") == 0 || strcasecmp(qname, "TURBOQUANT") == 0 || strcasecmp(qname, "TURBO2") == 0 || strcasecmp(qname, "TURBO3") == 0 || strcasecmp(qname, "TURBO4") == 0) return VECTOR_QUANT_TURBO;
     return -1;
 }
 
@@ -1086,6 +1599,19 @@ bool vector_keyvalue_callback (sqlite3_context *context, void *xdata, const char
         vector_qtype type = quant_name_to_type(buffer);
         if ((int)type == -1) return context_result_error(context, SQLITE_ERROR, "Invalid quantization type: '%s' is not a recognized or supported quantization type", buffer);
         options->q_type = type;
+        if (type == VECTOR_QUANT_TURBO) {
+            if (strcasecmp(buffer, "TURBO2") == 0) options->q_bits = 2;
+            else if (strcasecmp(buffer, "TURBO3") == 0) options->q_bits = 3;
+            else if (strcasecmp(buffer, "TURBO4") == 0) options->q_bits = 4;
+            else if (options->q_bits == 0) options->q_bits = 4;
+        }
+        return true;
+    }
+
+    if (KEY_MATCH(OPTION_KEY_QUANTBITS)) {
+        int bits = (int)strtol(buffer, NULL, 0);
+        if (bits < 2 || bits > 4) return context_result_error(context, SQLITE_ERROR, "Invalid TurboQuant bit width: expected 2, 3, or 4, got '%s'", buffer);
+        options->q_bits = bits;
         return true;
     }
     
@@ -1102,6 +1628,16 @@ bool vector_keyvalue_callback (sqlite3_context *context, void *xdata, const char
 
 static inline int nearly_zero_float32 (float x) {
     return fabsf(x) <= 8.0f * FLT_EPSILON;  // tweak factor for your use
+}
+
+static inline size_t quantized_vector_bytes (vector_qtype qtype, int dim, int bits) {
+    if (qtype == VECTOR_QUANT_1BIT) return (size_t)((dim + 7) / 8);
+    if (qtype == VECTOR_QUANT_TURBO) return sizeof(float) + turbo_bytes_for_dim(dim, bits);
+    return (size_t)dim * sizeof(uint8_t);
+}
+
+static inline size_t quantized_row_bytes (vector_qtype qtype, int dim, int bits) {
+    return sizeof(int64_t) + quantized_vector_bytes(qtype, dim, bits);
 }
 
 // MARK: - SQL -
@@ -1152,6 +1688,7 @@ void vector_context_free (void *p) {
             if (ctx->tables[i].c_name) sqlite3_free(ctx->tables[i].c_name);
             if (ctx->tables[i].pk_name) sqlite3_free(ctx->tables[i].pk_name);
             if (ctx->tables[i].preloaded) sqlite3_free(ctx->tables[i].preloaded);
+            table_context_free_turbo_cache(&ctx->tables[i]);
         }
         sqlite3_free(p);
     }
@@ -1205,7 +1742,18 @@ void vector_context_add (sqlite3_context *context, vector_context *ctx, const ch
     ctx->tables[index].options = *options;
     ctx->table_count++;
     
-    sqlite_unserialize(context, &ctx->tables[index]);
+    int rc = sqlite_unserialize(context, &ctx->tables[index]);
+    if (rc != SQLITE_OK) {
+        context_result_error(context, rc, "Unable to load vector metadata for '%s.%s'", table_name, column_name);
+        return;
+    }
+    if (ctx->tables[index].options.q_type == VECTOR_QUANT_TURBO) {
+        int bits = ctx->tables[index].options.q_bits;
+        int dim = ctx->tables[index].options.v_dim;
+        rc = table_context_ensure_turbo_codebook(&ctx->tables[index], bits, dim);
+        if (rc == SQLITE_OK) rc = table_context_ensure_turbo_plan(&ctx->tables[index], dim);
+        if (rc != SQLITE_OK) context_result_error(context, rc, "Unable to initialize TurboQuant cache for '%s.%s'", table_name, column_name);
+    }
 }
 
 void vector_options_init (vector_options *options) {
@@ -1214,6 +1762,7 @@ void vector_options_init (vector_options *options) {
     options->v_distance = VECTOR_DISTANCE_L2;
     options->max_memory = DEFAULT_MAX_MEMORY;
     options->q_type = VECTOR_QUANT_AUTO;
+    options->q_bits = 4;
 }
 
 vector_options vector_options_create (void) {
@@ -1250,12 +1799,11 @@ static int vector_serialize_quantization (sqlite3 *db, const char *table_name, c
     if (rc == SQLITE_DONE) rc = SQLITE_OK;
     
 vector_serialize_quantization_cleanup:
-    if (rc != SQLITE_OK) printf("Error in vector_serialize_quantization: %s\n", sqlite3_errmsg(db));
     if (vm) sqlite3_finalize(vm);
     return rc;
 }
 
-static int vector_rebuild_quantization (sqlite3_context *context, const char *table_name, const char *column_name, table_context *t_ctx, vector_qtype qtype, uint64_t max_memory, uint32_t *count) {
+static int vector_rebuild_quantization (sqlite3_context *context, const char *table_name, const char *column_name, table_context *t_ctx, vector_qtype qtype, int q_bits, uint64_t max_memory, uint32_t *count) {
     
     int rc = SQLITE_NOMEM;
     sqlite3_stmt *vm = NULL;
@@ -1266,10 +1814,22 @@ static int vector_rebuild_quantization (sqlite3_context *context, const char *ta
     const char *pk_name = t_ctx->pk_name;
     int dim = t_ctx->options.v_dim;
     vector_type type = t_ctx->options.v_type;
+    float *turbo_values = NULL;
+    float *turbo_rotated = NULL;
     
-    // compute size of a single quant, format is: rowid + quantize dimensions
-    size_t quant_bytes = (qtype == VECTOR_QUANT_1BIT) ? ((dim + 7) / 8) : (dim * sizeof(uint8_t));
-    size_t q_size = sizeof(int64_t) + quant_bytes;
+    if (qtype == VECTOR_QUANT_TURBO && (q_bits < 2 || q_bits > 4)) {
+        context_result_error(context, SQLITE_ERROR, "TurboQuant requires qbits=2, 3, or 4");
+        return SQLITE_MISUSE;
+    }
+
+    if (qtype == VECTOR_QUANT_TURBO && (type == VECTOR_TYPE_BIT || t_ctx->options.v_distance == VECTOR_DISTANCE_HAMMING || t_ctx->options.v_distance == VECTOR_DISTANCE_L1)) {
+        context_result_error(context, SQLITE_ERROR, "TurboQuant supports FLOAT/INT vectors with DOT, COSINE, L2, or SQUARED_L2 distance");
+        return SQLITE_MISUSE;
+    }
+    if (qtype != VECTOR_QUANT_TURBO) table_context_free_turbo_cache(t_ctx);
+
+    // compute size of a single quant, format is: rowid + quantized payload
+    size_t q_size = quantized_row_bytes(qtype, dim, q_bits);
     if (q_size == 0) {
         sqlite3_result_error(context, "Vector dimension is zero, which is not possible", -1);
         return SQLITE_MISUSE;
@@ -1283,8 +1843,17 @@ static int vector_rebuild_quantization (sqlite3_context *context, const char *ta
         if (count <= 0) {
             // no vectors
             t_ctx->options.q_type = (qtype == VECTOR_QUANT_AUTO) ? VECTOR_QUANT_U8BIT : qtype;
+            t_ctx->options.q_bits = q_bits;
             t_ctx->scale = 1.0f;
             t_ctx->offset = 0.0f;
+            if (t_ctx->options.q_type == VECTOR_QUANT_TURBO) {
+                rc = table_context_ensure_turbo_codebook(t_ctx, q_bits, dim);
+                if (rc == SQLITE_OK) rc = table_context_ensure_turbo_plan(t_ctx, dim);
+                if (rc != SQLITE_OK) {
+                    context_result_error(context, rc, "Unable to initialize TurboQuant cache");
+                    return rc;
+                }
+            }
             return SQLITE_OK;
         }
     }
@@ -1309,7 +1878,7 @@ static int vector_rebuild_quantization (sqlite3_context *context, const char *ta
     float max_val = -FLT_MAX;
     bool contains_negative = false;
 
-    if (qtype != VECTOR_QUANT_1BIT) {
+    if (qtype != VECTOR_QUANT_1BIT && qtype != VECTOR_QUANT_TURBO) {
         while (1) {
             rc = sqlite3_step(vm);
             if (rc == SQLITE_DONE) {rc = SQLITE_OK; break;}
@@ -1378,6 +1947,7 @@ static int vector_rebuild_quantization (sqlite3_context *context, const char *ta
     float offset = (qtype == VECTOR_QUANT_U8BIT) ? min_val : 0.0f;
     
     t_ctx->options.q_type = qtype;
+    t_ctx->options.q_bits = q_bits;
     t_ctx->scale = scale;
     t_ctx->offset = offset;
     
@@ -1389,6 +1959,15 @@ static int vector_rebuild_quantization (sqlite3_context *context, const char *ta
     // actual quantization (ONLY 8bit is supported in this version)
     uint32_t n_processed = 0;
     int64_t min_rowid = 0, max_rowid = 0;
+    if (qtype == VECTOR_QUANT_TURBO) {
+        rc = table_context_ensure_turbo_codebook(t_ctx, q_bits, dim);
+        if (rc != SQLITE_OK) goto vector_rebuild_quantization_cleanup;
+        rc = table_context_ensure_turbo_plan(t_ctx, dim);
+        if (rc != SQLITE_OK) goto vector_rebuild_quantization_cleanup;
+        turbo_values = (float *)sqlite3_malloc64((sqlite3_uint64)dim * sizeof(float));
+        turbo_rotated = (float *)sqlite3_malloc64((sqlite3_uint64)dim * sizeof(float));
+        if (!turbo_values || !turbo_rotated) { rc = SQLITE_NOMEM; goto vector_rebuild_quantization_cleanup; }
+    }
     while (1) {
         rc = sqlite3_step(vm);
         if (rc == SQLITE_DONE) {rc = SQLITE_OK; break;}
@@ -1398,6 +1977,13 @@ static int vector_rebuild_quantization (sqlite3_context *context, const char *ta
         int64_t rowid = (int64_t)sqlite3_column_int64(vm, 0);
         const void *blob = sqlite3_column_blob(vm, 1);
         if (!blob) continue;
+        size_t blob_size = (size_t)sqlite3_column_bytes(vm, 1);
+        size_t need_bytes = vector_bytes_for_dim(type, dim);
+        if (blob_size < need_bytes) {
+            context_result_error(context, SQLITE_ERROR, "Invalid vector blob found at rowid %lld", (long long)rowid);
+            rc = SQLITE_ERROR;
+            goto vector_rebuild_quantization_cleanup;
+        }
         
         if (n_processed == 0) min_rowid = rowid;
         VECTOR_PRINT((void *)blob, type, dim);
@@ -1407,7 +1993,23 @@ static int vector_rebuild_quantization (sqlite3_context *context, const char *ta
         data += sizeof(int64_t);
         
         // quantize vector
-        if (qtype == VECTOR_QUANT_1BIT) {
+        if (qtype == VECTOR_QUANT_TURBO) {
+            float norm_sq = turbo_copy_float(blob, type, dim, turbo_values);
+            turbo_normalize_inplace(turbo_values, dim, norm_sq);
+            turbo_rotate_with_plan(turbo_values, turbo_rotated, t_ctx->turbo_plan);
+
+            float inner = 0.0f;
+            uint8_t *scale_ptr = data;
+            data += sizeof(float);
+            turbo_quantize_rotated(turbo_rotated, data, t_ctx->turbo_boundaries, t_ctx->turbo_centroids, q_bits, dim, &inner);
+
+            float norm = sqrtf(norm_sq);
+            float vector_scale = 0.0f;
+            if (inner > 1e-10f) {
+                vector_scale = (t_ctx->options.v_distance == VECTOR_DISTANCE_COSINE || t_ctx->options.v_normalized) ? (1.0f / inner) : (norm / inner);
+            }
+            memcpy(scale_ptr, &vector_scale, sizeof(float));
+        } else if (qtype == VECTOR_QUANT_1BIT) {
             // 1-bit quantization: convert source to binary based on type
             switch (type) {
                 case VECTOR_TYPE_F32: quantize_binary((const float *)blob, data, dim, t_ctx->binary_mean); break;
@@ -1434,7 +2036,7 @@ static int vector_rebuild_quantization (sqlite3_context *context, const char *ta
         VECTOR_PRINT((void *)data, qprint, dim);
         #endif
         
-        data += (qtype == VECTOR_QUANT_1BIT) ? ((dim + 7) / 8) : (dim * sizeof(uint8_t));
+        data += (qtype == VECTOR_QUANT_TURBO) ? turbo_bytes_for_dim(dim, q_bits) : ((qtype == VECTOR_QUANT_1BIT) ? ((dim + 7) / 8) : (dim * sizeof(uint8_t)));
         max_rowid = rowid;
         ++n_processed;
         ++tot_processed;
@@ -1455,7 +2057,8 @@ static int vector_rebuild_quantization (sqlite3_context *context, const char *ta
     }
     
 vector_rebuild_quantization_cleanup:
-    if (rc != SQLITE_OK) printf("Error in vector_rebuild_quantization: %s\n", sqlite3_errmsg(db));
+    if (turbo_values) sqlite3_free(turbo_values);
+    if (turbo_rotated) sqlite3_free(turbo_rotated);
     if (original) sqlite3_free(original);
     if (vm) sqlite3_finalize(vm);
     if (count) *count = tot_processed;
@@ -1482,8 +2085,18 @@ static void vector_quantize_preload (sqlite3_context *context, int argc, sqlite3
         sqlite3_free(t_ctx->preloaded);
         t_ctx->preloaded = NULL;
         t_ctx->precounter = 0;
+        t_ctx->preloaded_bytes = 0;
     }
     sqlite3_mutex_leave(qmutex);
+
+    if (t_ctx->options.q_type == VECTOR_QUANT_TURBO) {
+        int rc = table_context_ensure_turbo_codebook(t_ctx, t_ctx->options.q_bits, t_ctx->options.v_dim);
+        if (rc == SQLITE_OK) rc = table_context_ensure_turbo_plan(t_ctx, t_ctx->options.v_dim);
+        if (rc != SQLITE_OK) {
+            context_result_error(context, rc, "Unable to initialize TurboQuant cache");
+            return;
+        }
+    }
     
     char sql[STATIC_SQL_SIZE];
     generate_memory_quant_table(table_name, column_name, sql);
@@ -1537,6 +2150,7 @@ static void vector_quantize_preload (sqlite3_context *context, int argc, sqlite3
     sqlite3_mutex_enter(qmutex);
     t_ctx->preloaded = buffer;
     t_ctx->precounter = counter;
+    t_ctx->preloaded_bytes = required;
     sqlite3_mutex_leave(qmutex);
 }
 
@@ -1570,12 +2184,14 @@ static int vector_quantize (sqlite3_context *context, const char *table_name, co
     if (res == false) {rc = SQLITE_ERROR; goto quantize_cleanup;}
     
     sqlite3_mutex_enter(qmutex);
-    rc = vector_rebuild_quantization(context, table_name, column_name, t_ctx, options.q_type, options.max_memory, &counter);
+    rc = vector_rebuild_quantization(context, table_name, column_name, t_ctx, options.q_type, options.q_bits, options.max_memory, &counter);
     sqlite3_mutex_leave(qmutex);
     if (rc != SQLITE_OK) goto quantize_cleanup;
     
     // serialize quantization options
     rc = sqlite_serialize(context, table_name, column_name, SQLITE_INTEGER, OPTION_KEY_QUANTTYPE, t_ctx->options.q_type, 0);
+    if (rc != SQLITE_OK) goto quantize_cleanup;
+    rc = sqlite_serialize(context, table_name, column_name, SQLITE_INTEGER, OPTION_KEY_QUANTBITS, t_ctx->options.q_bits, 0);
     if (rc != SQLITE_OK) goto quantize_cleanup;
     rc = sqlite_serialize(context, table_name, column_name, SQLITE_FLOAT, OPTION_KEY_QUANTSCALE, 0, t_ctx->scale);
     if (rc != SQLITE_OK) goto quantize_cleanup;
@@ -1614,7 +2230,7 @@ static void vector_quantize3 (sqlite3_context *context, int argc, sqlite3_value 
     
     bool was_preloaded = false;
     int rc = vector_quantize(context, table_name, column_name, options, &was_preloaded);
-    if ((rc == SQLITE_OK) && (was_preloaded)) vector_quantize_preload(context, argc, argv);
+    if ((rc == SQLITE_OK) && (was_preloaded)) vector_quantize_preload(context, 2, argv);
 }
 
 static void vector_quantize2 (sqlite3_context *context, int argc, sqlite3_value **argv) {
@@ -1661,6 +2277,7 @@ static void vector_quantize_cleanup (sqlite3_context *context, int argc, sqlite3
         sqlite3_free(t_ctx->preloaded);
         t_ctx->preloaded = NULL;
         t_ctx->precounter = 0;
+        t_ctx->preloaded_bytes = 0;
     }
     sqlite3_mutex_leave(qmutex);
 
@@ -1908,6 +2525,24 @@ static int vCursorFilterCommon (sqlite3_vtab_cursor *cur, int idxNum, const char
     vFullScanCursor *c = (vFullScanCursor *)cur;
     vFullScan *vtab = (vFullScan *)cur->pVtab;
 
+    if (c->stream.vm) {
+        sqlite3_finalize(c->stream.vm);
+        c->stream.vm = NULL;
+    }
+    if (c->stream.vector) {
+        sqlite3_free(c->stream.vector);
+        c->stream.vector = NULL;
+    }
+    if (c->stream.turbo_query_lut) {
+        sqlite3_free(c->stream.turbo_query_lut);
+        c->stream.turbo_query_lut = NULL;
+    }
+    if (c->stream.turbo_norm_lut) {
+        sqlite3_free(c->stream.turbo_norm_lut);
+        c->stream.turbo_norm_lut = NULL;
+    }
+    memset(&c->stream, 0, sizeof(c->stream));
+
     if (argc != 3 && argc != 4) {
         return sqlite_vtab_set_error(&vtab->base, "%s expects 3 or 4 arguments, but %d were provided", fname, argc);
     }
@@ -2010,6 +2645,7 @@ static int vCursorFilterCommon (sqlite3_vtab_cursor *cur, int idxNum, const char
 
     int rc = run_callback(vtab->db, c, vector, vsize);
     if (vector_allocated) sqlite3_free((void *)vector);
+    if (rc != SQLITE_OK) return rc;
     int count = sort_callback(c);
     c->row_count -= count;
 
@@ -2108,6 +2744,8 @@ static int vFullScanCursorClose (sqlite3_vtab_cursor *cur){
     if (c->rowids) sqlite3_free(c->rowids);
     if (c->distance) sqlite3_free(c->distance);
     if (c->stream.vector) sqlite3_free(c->stream.vector);
+    if (c->stream.turbo_query_lut) sqlite3_free(c->stream.turbo_query_lut);
+    if (c->stream.turbo_norm_lut) sqlite3_free(c->stream.turbo_norm_lut);
     if (c->stream.vm) sqlite3_finalize(c->stream.vm);
     sqlite3_free(c);
     return SQLITE_OK;
@@ -2152,6 +2790,93 @@ static int vFullScanCursorNext (sqlite3_vtab_cursor *cur){
             c->stream.rowid = (int64_t)sqlite3_column_int64(vm, 0);
             return SQLITE_OK;
         }
+    }
+
+    if (c->table->options.q_type == VECTOR_QUANT_TURBO) {
+        const size_t rowid_size = sizeof(int64_t);
+        const size_t packed_size = turbo_bytes_for_dim(dimension, c->stream.turbo_bits);
+        const size_t total_stride = rowid_size + sizeof(float) + packed_size;
+        const float *centroids = c->table->turbo_centroids;
+        vector_distance distance_type = c->table->options.v_distance;
+
+        if (vm == NULL) {
+            if (c->stream.data == NULL) return SQLITE_MISUSE;
+            if (c->stream.dindex >= c->stream.dcounter) {
+                c->stream.is_eof = 1;
+                return SQLITE_OK;
+            }
+            if (c->stream.data_bytes < 0 || (sqlite3_uint64)c->stream.data_bytes < ((sqlite3_uint64)c->stream.dindex + 1u) * (sqlite3_uint64)total_stride) {
+                return SQLITE_CORRUPT;
+            }
+
+            const uint8_t *current_data = (const uint8_t *)c->stream.data + ((size_t)c->stream.dindex * total_stride);
+            float scale = 0.0f;
+            memcpy(&scale, current_data + rowid_size, sizeof(float));
+            const uint8_t *packed = current_data + rowid_size + sizeof(float);
+            float distance;
+            if (c->stream.turbo_query_lut && (distance_type == VECTOR_DISTANCE_DOT || distance_type == VECTOR_DISTANCE_COSINE)) {
+                float dot = turbo_dot_from_lut(packed, scale, c->stream.turbo_query_lut, c->stream.turbo_lut_rows, c->stream.turbo_bits, (int)packed_size);
+                distance = (distance_type == VECTOR_DISTANCE_DOT) ? -dot : (1.0f - dot);
+                if (distance < 0.0f && distance_type == VECTOR_DISTANCE_COSINE) distance = 0.0f;
+            } else if (c->stream.turbo_query_lut && c->stream.turbo_norm_lut && (distance_type == VECTOR_DISTANCE_L2 || distance_type == VECTOR_DISTANCE_SQUARED_L2)) {
+                float dot = turbo_dot_from_lut(packed, scale, c->stream.turbo_query_lut, c->stream.turbo_lut_rows, c->stream.turbo_bits, (int)packed_size);
+                float norm = turbo_dot_from_lut(packed, 1.0f, c->stream.turbo_norm_lut, c->stream.turbo_lut_rows, c->stream.turbo_bits, (int)packed_size);
+                double d2 = (double)c->stream.turbo_qnorm_sq + ((double)scale * (double)scale * (double)norm) - 2.0 * (double)dot;
+                if (d2 < 0.0) d2 = 0.0;
+                distance = (distance_type == VECTOR_DISTANCE_L2) ? (float)sqrt(d2) : (float)d2;
+            } else {
+                distance = turbo_distance_from_rotated_query((const float *)v1, c->stream.turbo_qnorm_sq, packed, scale, centroids, c->stream.turbo_bits, dimension, distance_type);
+            }
+            if (nearly_zero_float32(distance)) distance = 0.0f;
+            c->stream.distance = distance;
+            c->stream.rowid = INT64_FROM_INT8PTR(current_data);
+            c->stream.dindex++;
+            return SQLITE_OK;
+        }
+
+        if (c->stream.dcounter == 0) {
+            int rc = sqlite3_step(vm);
+            if (rc == SQLITE_DONE) { c->stream.is_eof = 1; return SQLITE_OK; }
+            else if (rc != SQLITE_ROW) return rc;
+
+            c->stream.dcounter = sqlite3_column_int(vm, 0);
+            c->stream.data = (uint8_t *)sqlite3_column_blob(vm, 1);
+            c->stream.data_bytes = sqlite3_column_bytes(vm, 1);
+            c->stream.dindex = 0;
+            if (c->stream.data == NULL || c->stream.dcounter < 0 || c->stream.data_bytes < 0 || (sqlite3_uint64)c->stream.data_bytes < (sqlite3_uint64)c->stream.dcounter * (sqlite3_uint64)total_stride) {
+                return SQLITE_CORRUPT;
+            }
+        }
+
+        const uint8_t *current_data = (const uint8_t *)c->stream.data + ((size_t)c->stream.dindex * total_stride);
+        float scale = 0.0f;
+        memcpy(&scale, current_data + rowid_size, sizeof(float));
+        const uint8_t *packed = current_data + rowid_size + sizeof(float);
+        float distance;
+        if (c->stream.turbo_query_lut && (distance_type == VECTOR_DISTANCE_DOT || distance_type == VECTOR_DISTANCE_COSINE)) {
+            float dot = turbo_dot_from_lut(packed, scale, c->stream.turbo_query_lut, c->stream.turbo_lut_rows, c->stream.turbo_bits, (int)packed_size);
+            distance = (distance_type == VECTOR_DISTANCE_DOT) ? -dot : (1.0f - dot);
+            if (distance < 0.0f && distance_type == VECTOR_DISTANCE_COSINE) distance = 0.0f;
+        } else if (c->stream.turbo_query_lut && c->stream.turbo_norm_lut && (distance_type == VECTOR_DISTANCE_L2 || distance_type == VECTOR_DISTANCE_SQUARED_L2)) {
+            float dot = turbo_dot_from_lut(packed, scale, c->stream.turbo_query_lut, c->stream.turbo_lut_rows, c->stream.turbo_bits, (int)packed_size);
+            float norm = turbo_dot_from_lut(packed, 1.0f, c->stream.turbo_norm_lut, c->stream.turbo_lut_rows, c->stream.turbo_bits, (int)packed_size);
+            double d2 = (double)c->stream.turbo_qnorm_sq + ((double)scale * (double)scale * (double)norm) - 2.0 * (double)dot;
+            if (d2 < 0.0) d2 = 0.0;
+            distance = (distance_type == VECTOR_DISTANCE_L2) ? (float)sqrt(d2) : (float)d2;
+        } else {
+            distance = turbo_distance_from_rotated_query((const float *)v1, c->stream.turbo_qnorm_sq, packed, scale, centroids, c->stream.turbo_bits, dimension, distance_type);
+        }
+        if (nearly_zero_float32(distance)) distance = 0.0f;
+        c->stream.distance = distance;
+        c->stream.rowid = INT64_FROM_INT8PTR(current_data);
+        c->stream.dindex++;
+
+        if (c->stream.dindex == c->stream.dcounter) {
+            c->stream.dcounter = 0;
+            c->stream.data = NULL;
+            c->stream.data_bytes = 0;
+        }
+        return SQLITE_OK;
     }
 
     // QUANTIZATION sizes
@@ -2387,7 +3112,150 @@ static int vQuantRunMemory(vFullScanCursor *c, uint8_t *v, vector_qtype qtype, i
     return SQLITE_OK;
 }
 
+static int vTurboPrepareQuery (vFullScanCursor *c, const void *v1, float **qrot_out, float *qnorm_sq_out) {
+    int dim = c->table->options.v_dim;
+    vector_type type = c->table->options.v_type;
+    float *values = (float *)sqlite3_malloc64((sqlite3_uint64)dim * sizeof(float));
+    float *rotated = (float *)sqlite3_malloc64((sqlite3_uint64)dim * sizeof(float));
+    if (!values || !rotated) {
+        if (values) sqlite3_free(values);
+        if (rotated) sqlite3_free(rotated);
+        return SQLITE_NOMEM;
+    }
+
+    float norm_sq = turbo_copy_float(v1, type, dim, values);
+    if (c->table->options.v_distance == VECTOR_DISTANCE_COSINE) {
+        turbo_normalize_inplace(values, dim, norm_sq);
+        norm_sq = 1.0f;
+    }
+    int rc = table_context_require_turbo_cache(c->table, c->table->options.q_bits, dim);
+    if (rc != SQLITE_OK) {
+        sqlite3_free(values);
+        sqlite3_free(rotated);
+        return rc;
+    }
+    turbo_rotate_with_plan(values, rotated, c->table->turbo_plan);
+    sqlite3_free(values);
+
+    *qrot_out = rotated;
+    *qnorm_sq_out = norm_sq;
+    return SQLITE_OK;
+}
+
+static int vTurboRunPackedRows (vFullScanCursor *c, const uint8_t *data, sqlite3_int64 data_bytes, int counter, const float *qrot, float qnorm_sq, const float *centroids, const float *query_lut, const float *norm_lut, int lut_rows, int bits) {
+    int dim = c->table->options.v_dim;
+    vector_distance distance_type = c->table->options.v_distance;
+    size_t packed_bytes = turbo_bytes_for_dim(dim, bits);
+    size_t total_stride = sizeof(int64_t) + sizeof(float) + packed_bytes;
+    if (!data || counter < 0 || data_bytes < 0 || (sqlite3_uint64)data_bytes < (sqlite3_uint64)counter * (sqlite3_uint64)total_stride) {
+        return SQLITE_CORRUPT;
+    }
+
+    double *distance = c->distance;
+    int64_t *rowids = c->rowids;
+    int max_index = c->max_index;
+    double current_max = distance[max_index];
+
+    for (int i = 0; i < counter; ++i) {
+        const uint8_t *current = data + ((size_t)i * total_stride);
+        float scale = 0.0f;
+        memcpy(&scale, current + sizeof(int64_t), sizeof(float));
+        const uint8_t *packed = current + sizeof(int64_t) + sizeof(float);
+
+        float dist;
+        if (query_lut && (distance_type == VECTOR_DISTANCE_DOT || distance_type == VECTOR_DISTANCE_COSINE)) {
+            float dot = turbo_dot_from_lut(packed, scale, query_lut, lut_rows, bits, (int)packed_bytes);
+            dist = (distance_type == VECTOR_DISTANCE_DOT) ? -dot : (1.0f - dot);
+            if (dist < 0.0f && distance_type == VECTOR_DISTANCE_COSINE) dist = 0.0f;
+        } else if (query_lut && norm_lut && (distance_type == VECTOR_DISTANCE_L2 || distance_type == VECTOR_DISTANCE_SQUARED_L2)) {
+            float dot = turbo_dot_from_lut(packed, scale, query_lut, lut_rows, bits, (int)packed_bytes);
+            float norm = turbo_dot_from_lut(packed, 1.0f, norm_lut, lut_rows, bits, (int)packed_bytes);
+            double d2 = (double)qnorm_sq + ((double)scale * (double)scale * (double)norm) - 2.0 * (double)dot;
+            if (d2 < 0.0) d2 = 0.0;
+            dist = (distance_type == VECTOR_DISTANCE_L2) ? (float)sqrt(d2) : (float)d2;
+        } else {
+            dist = turbo_distance_from_rotated_query(qrot, qnorm_sq, packed, scale, centroids, bits, dim, distance_type);
+        }
+        if (nearly_zero_float32(dist)) dist = 0.0f;
+
+        if (dist < current_max) {
+            distance[max_index] = dist;
+            rowids[max_index] = INT64_FROM_INT8PTR(current);
+            max_index = vFullScanFindMaxIndex(distance, c->row_count);
+            current_max = distance[max_index];
+        }
+    }
+
+    c->max_index = max_index;
+    return SQLITE_OK;
+}
+
+static int vTurboRun (sqlite3 *db, vFullScanCursor *c, const void *v1, int v1size) {
+    (void)v1size;
+
+    int dim = c->table->options.v_dim;
+    int bits = c->table->options.q_bits;
+    float *qrot = NULL;
+    float *query_lut = NULL;
+    float *norm_lut = NULL;
+    int lut_rows = 0;
+    float qnorm_sq = 0.0f;
+    sqlite3_stmt *vm = NULL;
+    int rc = SQLITE_OK;
+
+    if (bits < 2 || bits > 4) return SQLITE_MISUSE;
+    rc = table_context_require_turbo_cache(c->table, bits, dim);
+    if (rc != SQLITE_OK) goto cleanup;
+    rc = vTurboPrepareQuery(c, v1, &qrot, &qnorm_sq);
+    if (rc != SQLITE_OK) goto cleanup;
+    if (c->table->options.v_distance == VECTOR_DISTANCE_DOT || c->table->options.v_distance == VECTOR_DISTANCE_COSINE ||
+        c->table->options.v_distance == VECTOR_DISTANCE_L2 || c->table->options.v_distance == VECTOR_DISTANCE_SQUARED_L2) {
+        query_lut = turbo_build_query_lut(qrot, c->table->turbo_centroids, bits, dim, &lut_rows);
+        if (!query_lut) { rc = SQLITE_NOMEM; goto cleanup; }
+    }
+    if (c->table->options.v_distance == VECTOR_DISTANCE_L2 || c->table->options.v_distance == VECTOR_DISTANCE_SQUARED_L2) {
+        int norm_rows = 0;
+        norm_lut = turbo_build_norm_lut(c->table->turbo_centroids, bits, dim, &norm_rows);
+        if (!norm_lut) { rc = SQLITE_NOMEM; goto cleanup; }
+        if (norm_rows != lut_rows) { rc = SQLITE_CORRUPT; goto cleanup; }
+    }
+
+    if (c->table->preloaded) {
+        rc = vTurboRunPackedRows(c, (const uint8_t *)c->table->preloaded, c->table->preloaded_bytes, c->table->precounter, qrot, qnorm_sq, c->table->turbo_centroids, query_lut, norm_lut, lut_rows, bits);
+        goto cleanup;
+    }
+
+    char sql[STATIC_SQL_SIZE];
+    generate_select_quant_table(c->table->t_name, c->table->c_name, sql);
+    rc = sqlite3_prepare_v2(db, sql, -1, &vm, NULL);
+    if (rc != SQLITE_OK) goto cleanup;
+
+    while (1) {
+        rc = sqlite3_step(vm);
+        if (rc == SQLITE_DONE) { rc = SQLITE_OK; break; }
+        if (rc != SQLITE_ROW) break;
+
+        int counter = sqlite3_column_int(vm, 0);
+        const uint8_t *data = (const uint8_t *)sqlite3_column_blob(vm, 1);
+        int bytes = sqlite3_column_bytes(vm, 1);
+        if (data) {
+            rc = vTurboRunPackedRows(c, data, bytes, counter, qrot, qnorm_sq, c->table->turbo_centroids, query_lut, norm_lut, lut_rows, bits);
+            if (rc != SQLITE_OK) break;
+        }
+    }
+
+cleanup:
+    if (rc != SQLITE_OK && c && c->base.pVtab) sqlite_vtab_set_error(c->base.pVtab, "TurboQuant scan failed: %s", sqlite3_errmsg(db));
+    if (vm) sqlite3_finalize(vm);
+    if (query_lut) sqlite3_free(query_lut);
+    if (norm_lut) sqlite3_free(norm_lut);
+    if (qrot) sqlite3_free(qrot);
+    return rc;
+}
+
 static int vQuantRun (sqlite3 *db, vFullScanCursor *c, const void *v1, int v1size) {
+    if (c->table->options.q_type == VECTOR_QUANT_TURBO) return vTurboRun(db, c, v1, v1size);
+
     // quantize target vector
     int dimension = c->table->options.v_dim;
     vector_qtype qtype = c->table->options.q_type;
@@ -2483,7 +3351,7 @@ static int vQuantRun (sqlite3 *db, vFullScanCursor *c, const void *v1, int v1siz
     rc = SQLITE_OK;
     
 vquant_run_cleanup:
-    if (rc != SQLITE_OK) printf("Error in vector_rebuild_quantization: %s\n", sqlite3_errmsg(db));
+    if (rc != SQLITE_OK && c && c->base.pVtab) sqlite_vtab_set_error(c->base.pVtab, "Quantized scan failed: %s", sqlite3_errmsg(db));
     if (vm) sqlite3_finalize(vm);
     if (v) sqlite3_free(v);
     return rc;
@@ -2509,7 +3377,11 @@ static int vStreamScanCursorRun (sqlite3 *db, vFullScanCursor *c, const void *v1
     c->stream.vdim = dimension;
     
     char *sql = sqlite3_mprintf("SELECT %q, %q FROM %q;", pk_name, col_name, table_name);
-    if (!sql) return SQLITE_NOMEM;
+    if (!sql) {
+        sqlite3_free(v);
+        c->stream.vector = NULL;
+        return SQLITE_NOMEM;
+    }
     
     sqlite3_stmt *vm = NULL;
     int rc = sqlite3_prepare_v2(db, sql, -1, &vm, NULL);
@@ -2530,10 +3402,95 @@ static int vStreamScanCursorRun (sqlite3 *db, vFullScanCursor *c, const void *v1
 cleanup:
     if (sql) sqlite3_free(sql);
     if (vm) sqlite3_finalize(vm);
+    if (v) sqlite3_free(v);
+    c->stream.vector = NULL;
     return rc;
 }
 
+static int vStreamTurboCursorRun (sqlite3 *db, vFullScanCursor *c, const void *v1, int v1size) {
+    (void)v1size;
+
+    float *qrot = NULL;
+    float qnorm_sq = 0.0f;
+    int dim = c->table->options.v_dim;
+    int bits = c->table->options.q_bits;
+    int rc = table_context_require_turbo_cache(c->table, bits, dim);
+    if (rc != SQLITE_OK) return rc;
+
+    rc = vTurboPrepareQuery(c, v1, &qrot, &qnorm_sq);
+    if (rc != SQLITE_OK) return rc;
+
+    c->stream.vector = qrot;
+    c->stream.vsize = (int)turbo_bytes_for_dim(dim, bits);
+    c->stream.vdim = dim;
+    c->stream.turbo_qnorm_sq = qnorm_sq;
+    c->stream.turbo_bits = bits;
+    if (c->table->options.v_distance == VECTOR_DISTANCE_DOT || c->table->options.v_distance == VECTOR_DISTANCE_COSINE ||
+        c->table->options.v_distance == VECTOR_DISTANCE_L2 || c->table->options.v_distance == VECTOR_DISTANCE_SQUARED_L2) {
+        c->stream.turbo_query_lut = turbo_build_query_lut(qrot, c->table->turbo_centroids, bits, dim, &c->stream.turbo_lut_rows);
+        if (!c->stream.turbo_query_lut) {
+            sqlite3_free(qrot);
+            c->stream.vector = NULL;
+            return SQLITE_NOMEM;
+        }
+    }
+    if (c->table->options.v_distance == VECTOR_DISTANCE_L2 || c->table->options.v_distance == VECTOR_DISTANCE_SQUARED_L2) {
+        int norm_rows = 0;
+        int norm_rc = SQLITE_OK;
+        c->stream.turbo_norm_lut = turbo_build_norm_lut(c->table->turbo_centroids, bits, dim, &norm_rows);
+        if (!c->stream.turbo_norm_lut) norm_rc = SQLITE_NOMEM;
+        else if (norm_rows != c->stream.turbo_lut_rows) norm_rc = SQLITE_CORRUPT;
+        if (norm_rc != SQLITE_OK) {
+            sqlite3_free(qrot);
+            if (c->stream.turbo_query_lut) {
+                sqlite3_free(c->stream.turbo_query_lut);
+                c->stream.turbo_query_lut = NULL;
+            }
+            if (c->stream.turbo_norm_lut) {
+                sqlite3_free(c->stream.turbo_norm_lut);
+                c->stream.turbo_norm_lut = NULL;
+            }
+            c->stream.turbo_lut_rows = 0;
+            c->stream.vector = NULL;
+            return norm_rc;
+        }
+    }
+
+    if (c->table->preloaded) {
+        c->stream.dindex = 0;
+        c->stream.data = c->table->preloaded;
+        c->stream.dcounter = c->table->precounter;
+        c->stream.data_bytes = c->table->preloaded_bytes;
+        return SQLITE_OK;
+    }
+
+    char sql[STATIC_SQL_SIZE];
+    generate_select_quant_table(c->table->t_name, c->table->c_name, sql);
+    sqlite3_stmt *vm = NULL;
+    rc = sqlite3_prepare_v2(db, sql, -1, &vm, NULL);
+    if (rc != SQLITE_OK) {
+        sqlite3_free(qrot);
+        if (c->stream.turbo_query_lut) {
+            sqlite3_free(c->stream.turbo_query_lut);
+            c->stream.turbo_query_lut = NULL;
+            c->stream.turbo_lut_rows = 0;
+        }
+        if (c->stream.turbo_norm_lut) {
+            sqlite3_free(c->stream.turbo_norm_lut);
+            c->stream.turbo_norm_lut = NULL;
+        }
+        c->stream.vector = NULL;
+        if (vm) sqlite3_finalize(vm);
+        return rc;
+    }
+
+    c->stream.vm = vm;
+    return SQLITE_OK;
+}
+
 static int vStreamQuantCursorRun (sqlite3 *db, vFullScanCursor *c, const void *v1, int v1size) {
+    if (c->table->options.q_type == VECTOR_QUANT_TURBO) return vStreamTurboCursorRun(db, c, v1, v1size);
+
     // quantize input vector
     int dimension = c->table->options.v_dim;
     vector_qtype qtype = c->table->options.q_type;
@@ -2602,6 +3559,8 @@ static int vStreamQuantCursorRun (sqlite3 *db, vFullScanCursor *c, const void *v
     
 cleanup:
     if (vm) sqlite3_finalize(vm);
+    if (v) sqlite3_free(v);
+    c->stream.vector = NULL;
     return rc;
 }
 
@@ -2726,6 +3685,10 @@ static void vector_version (sqlite3_context *context, int argc, sqlite3_value **
 static void vector_backend (sqlite3_context *context, int argc, sqlite3_value **argv) {
     sqlite3_result_text(context, distance_backend_name, -1, NULL);
 }
+
+static void vector_turboquant_backend (sqlite3_context *context, int argc, sqlite3_value **argv) {
+    sqlite3_result_text(context, turbo_lut_backend_name, -1, NULL);
+}
     
 // MARK: -
 
@@ -2761,6 +3724,9 @@ SQLITE_VECTOR_API int sqlite3_vector_init (sqlite3 *db, char **pzErrMsg, const s
     if (rc != SQLITE_OK) goto cleanup;
     
     rc = sqlite3_create_function(db, "vector_backend", 0, SQLITE_UTF8, ctx, vector_backend, NULL, NULL);
+    if (rc != SQLITE_OK) goto cleanup;
+
+    rc = sqlite3_create_function(db, "vector_turboquant_backend", 0, SQLITE_UTF8, ctx, vector_turboquant_backend, NULL, NULL);
     if (rc != SQLITE_OK) goto cleanup;
     
     // table_name, column_name, options

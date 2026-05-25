@@ -5,7 +5,7 @@
 
   <h1>SQLite-Vector</h1>
   <p><strong>Production-grade vector search inside SQLite.</strong><br>
-  Sub-millisecond ANN queries, 200KB binary, zero dependencies — runs anywhere SQLite runs: mobile, browser, edge, server.</p>
+  Exact search, SIMD distance kernels, and SIMD 2/3/4-bit TurboQuant scans — runs anywhere SQLite runs: mobile, browser, edge, server.</p>
 
   <p>
     <a href="https://dashboard.sqlitecloud.io/auth/sign-in"><strong>Free managed instance →</strong></a> ·
@@ -38,12 +38,15 @@
 
 # SQLite Vector
 
-**SQLite Vector** is a cross-platform, ultra-efficient SQLite extension that brings vector search capabilities to your embedded database. It works seamlessly on **iOS, Android, Windows, Linux, and macOS**, using just **30MB of memory** by default. With support for **Float32, Float16, BFloat16, Int8, UInt8 and 1Bit**, and **highly optimized distance functions**, it's the ideal solution for **Edge AI** applications.
+**SQLite Vector** is a cross-platform, ultra-efficient SQLite extension that brings vector search capabilities to your embedded database. It works seamlessly on **iOS, Android, Windows, Linux, and macOS**, using just **30MB of memory** by default. With support for **Float32, Float16, BFloat16, Int8, UInt8, 1Bit, and TurboQuant 2/3/4-bit quantization**, plus **highly optimized distance functions**, it's the ideal solution for **Edge AI** applications.
+
+SQLite-Vector includes **TurboQuant**, a compact data-oblivious vector quantizer inspired by the Google Research paper [TurboQuant: Online Vector Quantization with Near-Optimal Distortion Rate](https://arxiv.org/abs/2504.19874). It stores each vector as low-bit scalar codes plus one scale value, then scores directly from SIMD lookup-table kernels without reconstructing full vectors.
 
 ## Highlights
 
 * **No virtual tables required** – store vectors directly as `BLOB`s in ordinary tables
 * **Blazing fast** – optimized C implementation with SIMD acceleration
+* **TurboQuant support** – SIMD 2-, 3-, and 4-bit quantization scans with `qtype=TURBO`
 * **Low memory footprint** – defaults to just 30MB of RAM usage
 * **Zero preindexing needed** – no long preprocessing or index-building phases
 * **Works offline** – perfect for on-device, privacy-preserving AI workloads
@@ -59,6 +62,7 @@
 | Doesn't need preindexing     | ✅             | ❌ (can take hours for large datasets)      |
 | Doesn't need external server | ✅             | ❌ (often needs Redis/FAISS/Weaviate/etc.)  |
 | Memory-efficient             | ✅             | ❌                                          |
+| TurboQuant low-bit scanning  | ✅             | ❌                                          |
 | Easy to use SQL              | ✅             | ❌ (often complex JOINs, subqueries)        |
 | Offline/Edge ready           | ✅             | ❌                                          |
 | Cross-platform               | ✅             | ❌                                          |
@@ -118,6 +122,9 @@ SELECT vector_init('images', 'embedding', 'type=FLOAT32,dimension=384');
 -- Quantize vector
 SELECT vector_quantize('images', 'embedding');
 
+-- Or use TurboQuant for compact 2/3/4-bit quantization
+SELECT vector_quantize('images', 'embedding', 'qtype=TURBO,qbits=4');
+
 -- Optional preload quantized version in memory (for a 4x/5x speedup) 
 SELECT vector_quantize_preload('images', 'embedding');
 
@@ -133,6 +140,46 @@ SELECT e.id, v.distance FROM images AS e
    WHERE e.label = 'cat'
    LIMIT 10;
 ```
+
+## TurboQuant Benchmark and Recall
+
+TurboQuant can be selected with `qtype=TURBO,qbits=N`, where `N` is `2`, `3`, or `4`. Shorthand aliases are also available: `TURBO2`, `TURBO3`, and `TURBO4`.
+
+```sql
+-- Highest recall TurboQuant mode currently recommended as the default
+SELECT vector_quantize('images', 'embedding', 'qtype=TURBO,qbits=4');
+
+-- Smaller edge-oriented representation
+SELECT vector_quantize('images', 'embedding', 'qtype=TURBO2');
+```
+
+The following benchmark compares `vector_full_scan()` brute force against `vector_quantize_scan()` using TurboQuant on a synthetic dataset of **1,000,000 vectors**, **768 dimensions**, **DOT** distance, **k=10**, and **5 queries**. The database was file-backed, with raw vectors stored in SQLite and quantized data preloaded for the scan. Recall is measured as overlap with exact brute-force top-10 results. These numbers were measured on macOS ARM64 using the NEON backend; timings vary by CPU, storage, cache settings, and allocator behavior.
+
+| Mode | Quantized storage | Max RSS | Peak memory footprint | Full scan / query | TurboQuant / query | Speedup | Recall@10 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| TurboQuant 4-bit | 396 MB | ~488 MB | ~487 MB | 3248 ms | 218 ms | 14.92x | 0.84 |
+| TurboQuant 3-bit | 300 MB | ~394 MB | ~393 MB | 1727 ms | 188 ms | 9.19x | 0.74 |
+| TurboQuant 2-bit | 204 MB | ~310 MB | ~310 MB | 3265 ms | 85 ms | 38.27x | 0.48 |
+
+For comparison, the raw `FLOAT32` vectors alone are about **3.07 GB** for 1M x 768 before SQLite row/page overhead. TurboQuant 4-bit reduces the scan representation to about **13%** of that raw vector payload, TurboQuant 3-bit to about **10%**, and TurboQuant 2-bit to about **7%**. Actual resident memory depends on whether the database is in-memory or file-backed, SQLite cache settings, preloading, page cache behavior, and the host allocator.
+
+The TurboQuant scan backend can be checked separately from the regular distance backend:
+
+```sql
+SELECT vector_backend(), vector_turboquant_backend();
+```
+
+For edge deployments, `vector_quantize_memory(table, column)` estimates the quantized scan representation. TurboQuant stores each row as `rowid + scale + packed_codes`, roughly `rows * (8 + 4 + ceil(dim * qbits / 8))` bytes before allocator and SQLite cache overhead. The synthetic benchmark in `test/benchmark_turboquant.c` also supports `PRELOAD=0` to compare the lower-RAM, non-preloaded path.
+
+Real-dataset recall can be reproduced with `test/recall_turboquant_real.py`, which downloads Fashion-MNIST in the ANN-Benchmarks HDF5 format and compares TurboQuant against `vector_full_scan()` using L2 distance. Example run on macOS ARM64/NEON with 10,000 base vectors, 50 queries, and k=10:
+
+| Mode | Quantized storage | Full scan / query | TurboQuant / query | Speedup | Recall@10 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| TurboQuant 4-bit | 4.04 MB | 16.32 ms | 4.80 ms | 3.40x | 0.948 |
+| TurboQuant 3-bit | 3.06 MB | 16.32 ms | 8.28 ms | 1.97x | 0.868 |
+| TurboQuant 2-bit | 2.08 MB | 16.32 ms | 1.86 ms | 8.78x | 0.596 |
+
+`qbits=4` is the recommended starting point when recall matters. `qbits=2` is useful for tighter edge memory budgets, but should be validated on the target embeddings because recall can drop significantly depending on the dataset.
 
 ### Swift Package
 

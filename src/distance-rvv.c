@@ -16,6 +16,8 @@
 
 extern distance_function_t dispatch_distance_table[VECTOR_DISTANCE_MAX][VECTOR_TYPE_MAX];
 extern const char *distance_backend_name;
+extern turbo_lut_dot_function_t turbo_lut_dot_function;
+extern const char *turbo_lut_backend_name;
 
 // MARK: - UTILS -
 
@@ -985,6 +987,36 @@ float bit1_distance_hamming_rvv (const void *v1, const void *v2, int n) {
     // Copy the accumulator back into a scalar register
     return (float) uint64_sum_vector_u64m8(vdistance, vl);
 }
+
+static inline uint16_t turbo_lut3_index_rvv (const uint8_t *packed, int row, int packed_bytes) {
+    size_t bit_pos = (size_t)row * 12u;
+    size_t byte_pos = bit_pos / 8u;
+    int shift = (int)(bit_pos % 8u);
+    uint32_t word = 0;
+    if ((int)byte_pos < packed_bytes) word |= packed[byte_pos];
+    if ((int)byte_pos + 1 < packed_bytes) word |= (uint32_t)packed[byte_pos + 1] << 8;
+    return (uint16_t)((word >> shift) & 0x0fffu);
+}
+
+float turbo_lut_dot_rvv (const uint8_t *packed, float scale, const float *query_lut, int lut_rows, int bits, int packed_bytes) {
+    size_t vlmax = __riscv_vsetvlmax_e32m8();
+    vfloat32m8_t acc = __riscv_vfmv_v_f_f32m8(0.0f, vlmax);
+    int r = 0;
+    while (r < lut_rows) {
+        size_t n = (size_t)(lut_rows - r);
+        size_t vl = __riscv_vsetvl_e32m8(n);
+        float tmp[vl];
+        for (size_t i = 0; i < vl; ++i) {
+            int row = r + (int)i;
+            if (bits == 3) tmp[i] = query_lut[(size_t)row * 4096u + turbo_lut3_index_rvv(packed, row, packed_bytes)];
+            else tmp[i] = query_lut[(size_t)row * 256u + packed[row]];
+        }
+        vfloat32m8_t vals = __riscv_vle32_v_f32m8(tmp, vl);
+        acc = __riscv_vfadd_vv_f32m8(acc, vals, vl);
+        r += (int)vl;
+    }
+    return float32_sum_vector_f32m8(acc, vlmax) * scale;
+}
 #endif
 
 // MARK: -
@@ -1024,5 +1056,7 @@ void init_distance_functions_rvv (void) {
     dispatch_distance_table[VECTOR_DISTANCE_HAMMING][VECTOR_TYPE_BIT] = bit1_distance_hamming_rvv;
     
     distance_backend_name = "RVV";
+    turbo_lut_dot_function = turbo_lut_dot_rvv;
+    turbo_lut_backend_name = "RVV";
 #endif
 }

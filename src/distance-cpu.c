@@ -21,6 +21,8 @@
 
 const char *distance_backend_name = "CPU";
 distance_function_t dispatch_distance_table[VECTOR_DISTANCE_MAX][VECTOR_TYPE_MAX] = {0};
+const char *turbo_lut_backend_name = "CPU";
+turbo_lut_dot_function_t turbo_lut_dot_function = NULL;
 
 #define LASSQ_UPDATE(ad_) do {                            \
         double _ad = (ad_);                               \
@@ -864,6 +866,31 @@ float bit1_distance_hamming_cpu (const void *v1, const void *v2, int n) {
 
 // MARK: -
 
+static inline uint16_t turbo_lut3_index_cpu (const uint8_t *packed, int row, int packed_bytes) {
+    size_t bit_pos = (size_t)row * 12u;
+    size_t byte_pos = bit_pos / 8u;
+    int shift = (int)(bit_pos % 8u);
+    uint32_t word = 0;
+    if ((int)byte_pos < packed_bytes) word |= packed[byte_pos];
+    if ((int)byte_pos + 1 < packed_bytes) word |= (uint32_t)packed[byte_pos + 1] << 8;
+    return (uint16_t)((word >> shift) & 0x0fffu);
+}
+
+float turbo_lut_dot_cpu (const uint8_t *packed, float scale, const float *query_lut, int lut_rows, int bits, int packed_bytes) {
+    double dot = 0.0;
+    if (bits == 3) {
+        for (int r = 0; r < lut_rows; ++r) {
+            dot += (double)query_lut[(size_t)r * 4096u + turbo_lut3_index_cpu(packed, r, packed_bytes)];
+        }
+    } else {
+        (void)packed_bytes;
+        for (int r = 0; r < lut_rows; ++r) {
+            dot += (double)query_lut[(size_t)r * 256u + packed[r]];
+        }
+    }
+    return (float)(dot * (double)scale);
+}
+
 void init_cpu_functions (void) {
     distance_function_t cpu_table[VECTOR_DISTANCE_MAX][VECTOR_TYPE_MAX] = {
         [VECTOR_DISTANCE_L2] = {
@@ -907,6 +934,8 @@ void init_cpu_functions (void) {
     };
     
     memcpy(dispatch_distance_table, cpu_table, sizeof(cpu_table));
+    turbo_lut_dot_function = turbo_lut_dot_cpu;
+    turbo_lut_backend_name = "CPU";
 }
 
 void init_distance_functions (bool force_cpu) {
@@ -933,4 +962,3 @@ void init_distance_functions (bool force_cpu) {
     }
     #endif
 }
-

@@ -8,8 +8,10 @@
 #ifndef __VECTOR_DISTANCE_RVV__
 #define __VECTOR_DISTANCE_RVV__
 
+#include <stdint.h>
 #include <stdio.h>
 
 void init_distance_functions_rvv (void);
+float turbo_lut_dot_rvv (const uint8_t *packed, float scale, const float *query_lut, int lut_rows, int bits, int packed_bytes);
 
 #endif

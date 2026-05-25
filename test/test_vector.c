@@ -11,6 +11,7 @@
 #include <string.h>
 #include <strings.h>
 #include <math.h>
+#include <unistd.h>
 #include "sqlite3.h"
 #include "sqlite-vector.h"
 
@@ -70,6 +71,37 @@ static int setup_table(sqlite3 *db, const char *tbl, const char *type,
     return 0;
 }
 
+static int setup_f32_blob_table(sqlite3 *db, const char *tbl, const char *distance,
+                                int dim, const float *rows, int n) {
+    char sql[512];
+    sqlite3_stmt *stmt = NULL;
+
+    snprintf(sql, sizeof(sql), "CREATE TABLE \"%s\" (id INTEGER PRIMARY KEY, v BLOB);", tbl);
+    if (exec_sql(db, sql) != SQLITE_OK) return -1;
+
+    snprintf(sql, sizeof(sql), "INSERT INTO \"%s\" (id, v) VALUES (?1, ?2);", tbl);
+    int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
+    if (rc != SQLITE_OK) return -1;
+
+    for (int i = 0; i < n; ++i) {
+        sqlite3_reset(stmt);
+        sqlite3_clear_bindings(stmt);
+        sqlite3_bind_int(stmt, 1, i + 1);
+        sqlite3_bind_blob(stmt, 2, rows + (size_t)i * dim, dim * (int)sizeof(float), SQLITE_STATIC);
+        rc = sqlite3_step(stmt);
+        if (rc != SQLITE_DONE) {
+            sqlite3_finalize(stmt);
+            return -1;
+        }
+    }
+    sqlite3_finalize(stmt);
+
+    snprintf(sql, sizeof(sql),
+             "SELECT vector_init('%s', 'v', 'type=f32,dimension=%d,distance=%s');",
+             tbl, dim, distance);
+    return exec_sql(db, sql) == SQLITE_OK ? 0 : -1;
+}
+
 /* ---------- Callback helpers for querying results ---------- */
 
 typedef struct {
@@ -98,6 +130,45 @@ static int scan_cb_col0(void *ctx, int ncols, char **vals, char **names) {
     }
     r->count++;
     return 0;
+}
+
+static int exec_scan_sql(sqlite3 *db, const char *sql, sqlite3_callback cb, void *ctx) {
+    char *err = NULL;
+    int rc = sqlite3_exec(db, sql, cb, ctx, &err);
+    if (rc != SQLITE_OK) {
+        printf("  SQL error (%d): %s\n  Statement: %s\n", rc, err ? err : "unknown", sql);
+        sqlite3_free(err);
+    }
+    return rc;
+}
+
+static int exec_bound_scan_sql(sqlite3 *db, const char *sql, const float *query, int dim, scan_result *r) {
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
+    if (rc != SQLITE_OK) return rc;
+
+    rc = sqlite3_bind_blob(stmt, 1, query, dim * (int)sizeof(float), SQLITE_STATIC);
+    if (rc == SQLITE_OK) {
+        while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+            if (r->count < 64) {
+                r->ids[r->count] = sqlite3_column_int(stmt, 0);
+                r->distances[r->count] = sqlite3_column_double(stmt, 1);
+            }
+            r->count++;
+        }
+        if (rc == SQLITE_DONE) rc = SQLITE_OK;
+    }
+
+    int frc = sqlite3_finalize(stmt);
+    return rc == SQLITE_OK ? frc : rc;
+}
+
+static int open_stmt_count(sqlite3 *db) {
+    int count = 0;
+    for (sqlite3_stmt *stmt = sqlite3_next_stmt(db, NULL); stmt; stmt = sqlite3_next_stmt(db, stmt)) {
+        count++;
+    }
+    return count;
 }
 
 /* ---------- Test: basics ---------- */
@@ -129,6 +200,20 @@ static void test_basics(sqlite3 *db) {
             ASSERT(rc == SQLITE_ROW, "vector_backend() returns a row");
             const char *v = (const char *)sqlite3_column_text(stmt, 0);
             ASSERT(v != NULL && strlen(v) > 0, "vector_backend() returns non-empty text");
+        }
+        sqlite3_finalize(stmt);
+    }
+
+    /* vector_turboquant_backend() */
+    {
+        sqlite3_stmt *stmt;
+        int rc = sqlite3_prepare_v2(db, "SELECT vector_turboquant_backend();", -1, &stmt, NULL);
+        ASSERT(rc == SQLITE_OK, "vector_turboquant_backend() prepares");
+        if (rc == SQLITE_OK) {
+            rc = sqlite3_step(stmt);
+            ASSERT(rc == SQLITE_ROW, "vector_turboquant_backend() returns a row");
+            const char *v = (const char *)sqlite3_column_text(stmt, 0);
+            ASSERT(v != NULL && strlen(v) > 0, "vector_turboquant_backend() returns non-empty text");
         }
         sqlite3_finalize(stmt);
     }
@@ -273,6 +358,287 @@ static void test_quantize_scan(sqlite3 *db, const char *type, const char *qtype,
         snprintf(msg, sizeof(msg), "quantize_scan stream returns rows (%s/%s)", type, qtype);
         ASSERT(r.count > 0, msg);
     }
+}
+
+static void test_turboquant(sqlite3 *db) {
+    printf("\n=== TurboQuant ===\n");
+
+    char primary_tbl[64] = "tq_f32_DOT_4";
+    const char *tbl = primary_tbl;
+    const int dim = 16;
+    const char *vecs[] = {
+        "[1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0]",
+        "[-1, -1, -1, -1, -1, -1, -1, -1, 0, 0, 0, 0, 0, 0, 0, 0]",
+        "[0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1]",
+        "[0, 0, 0, 0, 0, 0, 0, 0, -1, -1, -1, -1, -1, -1, -1, -1]",
+        "[1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0]",
+        "[0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1]",
+        "[2, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]",
+        "[0, 0, 0, 0, 0, 0, 0, 0, 2, 2, 2, 2, 0, 0, 0, 0]"
+    };
+    const char *query = "[1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0]";
+    char sql[1024];
+
+    ASSERT(open_stmt_count(db) == 0, "no open statements before TurboQuant test");
+
+    const char *distances[] = {"DOT", "COSINE", "L2", "SQUARED_L2"};
+    const int bits_values[] = {2, 3, 4};
+    for (int d = 0; d < 4; ++d) {
+        for (int b = 0; b < 3; ++b) {
+            int bits = bits_values[b];
+            char tname[64];
+            char msg[160];
+            snprintf(tname, sizeof(tname), "tq_f32_%s_%d", distances[d], bits);
+            if (setup_table(db, tname, "f32", distances[d], dim, vecs, 8) != 0) {
+                snprintf(msg, sizeof(msg), "TurboQuant setup %s qbits=%d", distances[d], bits);
+                ASSERT(0, msg);
+                return;
+            }
+
+            snprintf(sql, sizeof(sql), "SELECT vector_quantize('%s', 'v', 'qtype=TURBO,qbits=%d,max_memory=96');", tname, bits);
+            snprintf(msg, sizeof(msg), "vector_quantize TurboQuant %s qbits=%d executes", distances[d], bits);
+            ASSERT(exec_sql(db, sql) == SQLITE_OK, msg);
+
+            {
+                sqlite3_stmt *stmt = NULL;
+                snprintf(sql, sizeof(sql), "SELECT vector_quantize_memory('%s', 'v');", tname);
+                int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
+                ASSERT(rc == SQLITE_OK, "TurboQuant memory prepares");
+                if (rc == SQLITE_OK && sqlite3_step(stmt) == SQLITE_ROW) {
+                    sqlite3_int64 bytes = sqlite3_column_int64(stmt, 0);
+                    sqlite3_int64 expected = (sqlite3_int64)8 * (sqlite3_int64)(sizeof(int64_t) + sizeof(float) + ((dim * bits + 7) / 8));
+                    snprintf(msg, sizeof(msg), "TurboQuant qbits=%d uses expected compact storage", bits);
+                    ASSERT(bytes == expected, msg);
+                } else {
+                    ASSERT(0, "TurboQuant memory returns a row");
+                }
+                sqlite3_finalize(stmt);
+            }
+
+            scan_result exact = {0};
+            snprintf(sql, sizeof(sql),
+                     "SELECT id, distance FROM vector_full_scan('%s', 'v', vector_as_f32('%s'), 1);",
+                     tname, query);
+            snprintf(msg, sizeof(msg), "TurboQuant exact top-1 executes %s qbits=%d", distances[d], bits);
+            ASSERT(sqlite3_exec(db, sql, scan_cb, &exact, NULL) == SQLITE_OK, msg);
+
+            scan_result approx = {0};
+            snprintf(sql, sizeof(sql),
+                     "SELECT id, distance FROM vector_quantize_scan('%s', 'v', vector_as_f32('%s'), 1);",
+                     tname, query);
+            snprintf(msg, sizeof(msg), "TurboQuant top-1 executes %s qbits=%d", distances[d], bits);
+            ASSERT(sqlite3_exec(db, sql, scan_cb, &approx, NULL) == SQLITE_OK, msg);
+            snprintf(msg, sizeof(msg), "TurboQuant top-1 matches full scan %s qbits=%d", distances[d], bits);
+            ASSERT(exact.count == 1 && approx.count == 1 && exact.ids[0] == approx.ids[0], msg);
+            if (strcmp(distances[d], "DOT") == 0) {
+                ASSERT(approx.distances[0] < 0.0, "TurboQuant DOT distance uses negative score convention");
+            }
+
+            if (strcmp(distances[d], "DOT") == 0 && bits == 4) {
+                snprintf(primary_tbl, sizeof(primary_tbl), "%s", tname);
+                tbl = primary_tbl;
+                snprintf(sql, sizeof(sql), "SELECT vector_quantize_preload('%s', 'v');", tbl);
+                ASSERT(exec_sql(db, sql) == SQLITE_OK, "TurboQuant preload executes");
+
+                memset(&approx, 0, sizeof(approx));
+                snprintf(sql, sizeof(sql),
+                         "SELECT id, distance FROM vector_quantize_scan('%s', 'v', vector_as_f32('%s'), 3);",
+                         tbl, query);
+                ASSERT(exec_scan_sql(db, sql, scan_cb, &approx) == SQLITE_OK, "preloaded TurboQuant top-k executes");
+                ASSERT(approx.count == 3, "preloaded TurboQuant returns k rows");
+
+                scan_result streamed = {0};
+                snprintf(sql, sizeof(sql),
+                         "SELECT id, distance FROM vector_quantize_scan('%s', 'v', vector_as_f32('%s')) ORDER BY distance LIMIT 3;",
+                         tbl, query);
+                ASSERT(exec_scan_sql(db, sql, scan_cb, &streamed) == SQLITE_OK, "TurboQuant streaming scan executes");
+                ASSERT(streamed.count == 3, "TurboQuant streaming scan returns rows");
+            }
+        }
+    }
+
+    snprintf(sql, sizeof(sql), "SELECT vector_quantize('%s', 'v', 'qtype=TURBO2');", tbl);
+    ASSERT(exec_sql(db, sql) == SQLITE_OK, "vector_quantize qtype=TURBO2 executes");
+
+    snprintf(sql, sizeof(sql), "SELECT vector_quantize('%s', 'v', 'qtype=TURBO,qbits=5');", tbl);
+    {
+        char *err = NULL;
+        int rc = sqlite3_exec(db, sql, NULL, NULL, &err);
+        ASSERT(rc != SQLITE_OK, "TurboQuant rejects unsupported qbits");
+        sqlite3_free(err);
+    }
+
+    {
+        const char *wr = "tq_without_rowid";
+        snprintf(sql, sizeof(sql), "CREATE TABLE \"%s\" (id INTEGER PRIMARY KEY, v BLOB) WITHOUT ROWID;", wr);
+        ASSERT(exec_sql(db, sql) == SQLITE_OK, "TurboQuant WITHOUT ROWID table creates");
+        for (int i = 0; i < 8; ++i) {
+            snprintf(sql, sizeof(sql), "INSERT INTO \"%s\" (id, v) VALUES (%d, vector_as_f32('%s'));", wr, i + 1, vecs[i]);
+            ASSERT(exec_sql(db, sql) == SQLITE_OK, "TurboQuant WITHOUT ROWID insert");
+        }
+        snprintf(sql, sizeof(sql), "SELECT vector_init('%s', 'v', 'type=f32,dimension=%d,distance=DOT');", wr, dim);
+        ASSERT(exec_sql(db, sql) == SQLITE_OK, "TurboQuant WITHOUT ROWID vector_init");
+        snprintf(sql, sizeof(sql), "SELECT vector_quantize('%s', 'v', 'qtype=TURBO,qbits=2');", wr);
+        ASSERT(exec_sql(db, sql) == SQLITE_OK, "TurboQuant WITHOUT ROWID quantize");
+        scan_result wr_result = {0};
+        snprintf(sql, sizeof(sql), "SELECT id, distance FROM vector_quantize_scan('%s', 'v', vector_as_f32('%s'), 1);", wr, query);
+        ASSERT(sqlite3_exec(db, sql, scan_cb, &wr_result, NULL) == SQLITE_OK, "TurboQuant WITHOUT ROWID scan");
+        ASSERT(wr_result.count == 1 && wr_result.ids[0] == 1, "TurboQuant WITHOUT ROWID top-1");
+    }
+
+    {
+        const char *corrupt = "tq_corrupt";
+        if (setup_table(db, corrupt, "f32", "DOT", dim, vecs, 8) == 0) {
+            snprintf(sql, sizeof(sql), "SELECT vector_quantize('%s', 'v', 'qtype=TURBO,qbits=4,max_memory=0');", corrupt);
+            ASSERT(exec_sql(db, sql) == SQLITE_OK, "TurboQuant corrupt-fixture quantize");
+            snprintf(sql, sizeof(sql), "UPDATE \"vector0_%s_v\" SET data = substr(data, 1, 3) WHERE rowid = (SELECT rowid FROM \"vector0_%s_v\" LIMIT 1);", corrupt, corrupt);
+            ASSERT(exec_sql(db, sql) == SQLITE_OK, "TurboQuant corrupt-fixture truncates blob");
+            snprintf(sql, sizeof(sql), "SELECT id, distance FROM vector_quantize_scan('%s', 'v', vector_as_f32('%s'), 1);", corrupt, query);
+            char *err = NULL;
+            int rc = sqlite3_exec(db, sql, NULL, NULL, &err);
+            ASSERT(rc != SQLITE_OK, "TurboQuant rejects undersized quant blob");
+            sqlite3_free(err);
+        } else {
+            ASSERT(0, "TurboQuant corrupt-fixture setup");
+        }
+    }
+
+    ASSERT(open_stmt_count(db) == 0, "no open statements after TurboQuant test");
+}
+
+static void test_turboquant_edge_dimensions(sqlite3 *db) {
+    printf("\n=== TurboQuant Edge Dimensions ===\n");
+
+    sqlite3 *edge_db = NULL;
+    char *errmsg = NULL;
+    int rc = sqlite3_open(":memory:", &edge_db);
+    ASSERT(rc == SQLITE_OK, "TurboQuant edge-dimension database opens");
+    if (rc != SQLITE_OK) return;
+    ASSERT(sqlite3_vector_init(edge_db, &errmsg, NULL) == SQLITE_OK, "TurboQuant edge-dimension extension init");
+    sqlite3_free(errmsg);
+    db = edge_db;
+
+    const int dims[] = {1, 3, 7, 15, 17, 769};
+    const int bits_values[] = {2, 3, 4};
+    const char *distances[] = {"DOT", "COSINE", "L2", "SQUARED_L2"};
+    const int nrows = 4;
+    char sql[512];
+    char msg[192];
+
+    ASSERT(open_stmt_count(db) == 0, "no open statements before TurboQuant edge-dimension test");
+
+    for (int di = 0; di < (int)(sizeof(dims) / sizeof(dims[0])); ++di) {
+        int dim = dims[di];
+        float *rows = (float *)sqlite3_malloc64((sqlite3_uint64)nrows * (sqlite3_uint64)dim * sizeof(float));
+        if (!rows) {
+            ASSERT(0, "TurboQuant edge-dimension fixture allocates rows");
+            sqlite3_close(edge_db);
+            return;
+        }
+
+        for (int j = 0; j < dim; ++j) {
+            rows[j] = 1.0f;
+            rows[dim + j] = -1.0f;
+            rows[2 * dim + j] = 0.0f;
+            rows[3 * dim + j] = 0.0f;
+        }
+        rows[3 * dim + (dim > 1 ? dim - 1 : 0)] = dim > 1 ? 1.0f : -0.5f;
+
+        for (int d = 0; d < 4; ++d) {
+            for (int b = 0; b < 3; ++b) {
+                int bits = bits_values[b];
+                char tname[80];
+                snprintf(tname, sizeof(tname), "tq_edge_%s_%d_%d", distances[d], dim, bits);
+
+                if (setup_f32_blob_table(db, tname, distances[d], dim, rows, nrows) != 0) {
+                    snprintf(msg, sizeof(msg), "TurboQuant edge setup %s dim=%d qbits=%d", distances[d], dim, bits);
+                    ASSERT(0, msg);
+                    sqlite3_free(rows);
+                    sqlite3_close(edge_db);
+                    return;
+                }
+
+                snprintf(sql, sizeof(sql), "SELECT vector_quantize('%s', 'v', 'qtype=TURBO,qbits=%d,max_memory=0');", tname, bits);
+                snprintf(msg, sizeof(msg), "TurboQuant edge quantize %s dim=%d qbits=%d", distances[d], dim, bits);
+                ASSERT(exec_sql(db, sql) == SQLITE_OK, msg);
+
+                scan_result exact = {0};
+                snprintf(sql, sizeof(sql), "SELECT id, distance FROM vector_full_scan('%s', 'v', ?1, 1);", tname);
+                snprintf(msg, sizeof(msg), "TurboQuant edge exact scan %s dim=%d qbits=%d", distances[d], dim, bits);
+                ASSERT(exec_bound_scan_sql(db, sql, rows, dim, &exact) == SQLITE_OK, msg);
+                snprintf(msg, sizeof(msg), "TurboQuant edge exact returns one row %s dim=%d qbits=%d", distances[d], dim, bits);
+                ASSERT(exact.count == 1, msg);
+
+                scan_result approx = {0};
+                snprintf(sql, sizeof(sql), "SELECT id, distance FROM vector_quantize_scan('%s', 'v', ?1, 1);", tname);
+                snprintf(msg, sizeof(msg), "TurboQuant edge scan %s dim=%d qbits=%d", distances[d], dim, bits);
+                ASSERT(exec_bound_scan_sql(db, sql, rows, dim, &approx) == SQLITE_OK, msg);
+
+                snprintf(msg, sizeof(msg), "TurboQuant edge scan returns one row %s dim=%d qbits=%d", distances[d], dim, bits);
+                ASSERT(approx.count == 1 && approx.ids[0] >= 1 && approx.ids[0] <= nrows, msg);
+
+                scan_result streamed = {0};
+                snprintf(sql, sizeof(sql), "SELECT id, distance FROM vector_quantize_scan('%s', 'v', ?1) LIMIT 2;", tname);
+                snprintf(msg, sizeof(msg), "TurboQuant edge streaming scan %s dim=%d qbits=%d", distances[d], dim, bits);
+                ASSERT(exec_bound_scan_sql(db, sql, rows, dim, &streamed) == SQLITE_OK, msg);
+                snprintf(msg, sizeof(msg), "TurboQuant edge streaming returns rows %s dim=%d qbits=%d", distances[d], dim, bits);
+                ASSERT(streamed.count == 2, msg);
+            }
+        }
+
+        sqlite3_free(rows);
+    }
+
+    ASSERT(open_stmt_count(db) == 0, "no open statements after TurboQuant edge-dimension test");
+    sqlite3_close(edge_db);
+}
+
+static void test_turboquant_reopen(void) {
+    printf("\n=== TurboQuant Reopen ===\n");
+
+    char path[256];
+    snprintf(path, sizeof(path), "/tmp/sqlite_vector_turboquant_%ld.db", (long)getpid());
+    unlink(path);
+
+    const char *vecs[] = {
+        "[1, 1, 1, 1, 0, 0, 0, 0]",
+        "[0, 0, 0, 0, 1, 1, 1, 1]",
+        "[-1, -1, -1, -1, 0, 0, 0, 0]"
+    };
+    const char *query = "[1, 1, 1, 1, 0, 0, 0, 0]";
+    const char *tbl = "tq_reopen";
+    char sql[1024];
+    sqlite3 *db = NULL;
+    char *errmsg = NULL;
+
+    int rc = sqlite3_open(path, &db);
+    ASSERT(rc == SQLITE_OK, "TurboQuant reopen database opens");
+    ASSERT(sqlite3_vector_init(db, &errmsg, NULL) == SQLITE_OK, "TurboQuant reopen extension init");
+    if (setup_table(db, tbl, "f32", "DOT", 8, vecs, 3) == 0) {
+        snprintf(sql, sizeof(sql), "SELECT vector_quantize('%s', 'v', 'qtype=TURBO,qbits=2,max_memory=0');", tbl);
+        ASSERT(exec_sql(db, sql) == SQLITE_OK, "TurboQuant reopen quantize");
+    } else {
+        ASSERT(0, "TurboQuant reopen setup");
+    }
+    ASSERT(open_stmt_count(db) == 0, "TurboQuant reopen no open statements before close");
+    sqlite3_close(db);
+    db = NULL;
+
+    rc = sqlite3_open(path, &db);
+    ASSERT(rc == SQLITE_OK, "TurboQuant reopen database reopens");
+    errmsg = NULL;
+    ASSERT(sqlite3_vector_init(db, &errmsg, NULL) == SQLITE_OK, "TurboQuant reopen extension re-init");
+    snprintf(sql, sizeof(sql), "SELECT vector_init('%s', 'v', 'type=f32,dimension=8,distance=DOT');", tbl);
+    ASSERT(exec_sql(db, sql) == SQLITE_OK, "TurboQuant reopen vector_init reloads metadata");
+
+    scan_result r = {0};
+    snprintf(sql, sizeof(sql), "SELECT id, distance FROM vector_quantize_scan('%s', 'v', vector_as_f32('%s'), 1);", tbl, query);
+    ASSERT(sqlite3_exec(db, sql, scan_cb, &r, NULL) == SQLITE_OK, "TurboQuant reopen scan executes");
+    ASSERT(r.count == 1 && r.ids[0] == 1, "TurboQuant reopen top-1");
+    ASSERT(open_stmt_count(db) == 0, "TurboQuant reopen no open statements after scan");
+
+    sqlite3_close(db);
+    unlink(path);
 }
 
 /* ---------- Test vectors ---------- */
@@ -714,6 +1080,10 @@ int main(void) {
         /* BIT — quantize with 1BIT */
         test_quantize_scan(db, "bit", "1BIT", 8, bit_vecs, bit_nvecs, bit_query);
     }
+
+    test_turboquant(db);
+    test_turboquant_edge_dimensions(db);
+    test_turboquant_reopen();
 
     /* 4. Streaming ORDER BY (regression test for issue #43) */
     printf("\n=== Streaming ORDER BY ===\n");
