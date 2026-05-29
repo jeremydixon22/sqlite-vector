@@ -959,10 +959,11 @@ float int8_distance_cosine_avx2 (const void *a, const void *b, int n) {
 
 // MARK: - BIT -
 
-// lookup table for popcount of 4-bit values
-static const __m256i popcount_lut = _mm256_setr_epi8(0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4, 0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4);
+// lookup table for popcount of 4-bit values (plain byte array — avoids GCC static-init restriction on intrinsics)
+static const char popcount_lut_bytes[32] = {0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4, 0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4};
 
 static inline __m256i popcount_avx2(__m256i v) {
+    __m256i popcount_lut = _mm256_loadu_si256((const __m256i*)popcount_lut_bytes);
     __m256i low_mask = _mm256_set1_epi8(0x0f);
     __m256i lo = _mm256_and_si256(v, low_mask);
     __m256i hi = _mm256_and_si256(_mm256_srli_epi16(v, 4), low_mask);
